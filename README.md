@@ -1,766 +1,1062 @@
-# CVE2Rule
+# Sentinel Detection-as-Code Lab
 
-A multi-agent threat hunting and detection-engineering lab built on Microsoft Sentinel. Enter a CVE and the system researches it, extracts IOCs and MITRE ATT&CK techniques, generates hunting hypotheses and a Sigma rule with tests, validates it in CI, converts it to KQL, deploys it to Sentinel as detection-as-code, and hands alerts to a SOAR agent that proposes containment for human approval.
+A hands-on, end-to-end security operations lab on Microsoft Sentinel and the Microsoft Defender portal. Anyone with an Azure subscription and a GitHub account can follow it step by step.
 
-What makes it different from "ask an LLM for a Sigma rule":
+You will:
 
-- **Grounded output**: every IOC must quote its source, and deterministic code checks the quote exists before anything moves on.
-- **Held-out testing**: generated rules are scored against human-written logs the generator never sees, so a rule can't pass by writing its own easy tests.
-- **One field contract**: the table schema, the pySigma pipeline, the test logs and the Sentinel table all share the same columns, and CI tests that mapping.
-- **Real detection-as-code**: Sigma in Git, KQL built in CI, analytics rules created, updated and deleted in Sentinel through a protected, OIDC-authenticated pipeline.
-- **Humans approve the risky steps**: rule deployment and containment are graph interrupts and protected environments, not prompt instructions.
+1. Write detection rules as YAML with KQL inside, test them in GitHub Actions, and deploy them to Sentinel through a CI/CD pipeline.
+2. Make a real change in your Azure subscription that triggers a rule, and follow it from log event → alert → incident.
+3. Have a Sentinel SOAR playbook, built with the Defender portal's playbook generator, respond to the alert automatically.
+4. Ingest a threat feed and match it against your activity.
+5. Build your own AI agents from scratch, modelled on the agents Microsoft ships for its security products: an incident triage agent, a threat-intel briefing agent, and a detection engineering agent that turns a CVE file in the repo into a tested detection-rule pull request.
 
-The project is also a learning path for AI engineering (agent design, evals, testing, CI/CD, identity, observability) on a real security problem. Weekly lesson notes live in [notes/](notes/).
+The lab shows, with working code and evidence, the skills a detection engineering or SOC automation role needs:
 
-**Status:** planning. Slice 0a is next.
+- **Detection-as-code**: rules live in Git, change through pull requests, and are tested before they reach Sentinel.
+- **Secure CI/CD**: GitHub Actions authenticates to Azure with OIDC (no stored secrets), and production deploys need a human approval.
+- **Alert → incident → response**: real Azure activity fires the rule, and an automation rule runs a playbook without a human starting it.
+- **Agents with guardrails**: agents read, reason and propose; humans approve anything that changes production.
+- **Small and finished beats big and half-done**: each phase works end to end before the next one starts.
 
-> Run everything in an isolated lab with synthetic data, in a personal Azure subscription dedicated to this project. Never run Atomic Red Team tests or block IPs on production systems, and never point the lab at an employer tenant.
+**Status:** Phase 0 (setup). Planned with [OpenSpec](https://github.com/Fission-AI/openspec) (see [section 12](#12-spec-driven-workflow-with-openspec)).
 
----
-
-## 1. Goals
-
-- Build a working end-to-end agentic detection pipeline on a real Sentinel workspace.
-- Learn detection engineering: Sigma, pySigma pipelines, KQL, Sentinel analytics rules, detection-as-code lifecycle.
-- Learn cloud identity done properly: OIDC federation, least-privilege RBAC, managed identities.
-- Learn AI engineering: agent design, structured outputs, grounding, evals, cost control, observability.
-- Learn agent orchestration patterns step by step: sequential, loop, human-in-the-loop, then parallel, supervisor and agent-to-agent.
-- Learn adversary emulation with Atomic Red Team and SOAR with Sentinel playbooks.
+> **Lab only.** Use a personal Azure subscription and tenant dedicated to this lab, never an employer or production tenant. Anything that can change resources is scoped to one lab resource group.
 
 ---
 
-## 2. End-to-end workflow
+## Contents
 
-```mermaid
-flowchart TD
-    A[User enters CVE-ID<br/>CLI / API] --> B[Threat Researcher Agent<br/>NVD, CISA KEV, ATT&CK]
-    B --> C[Threat Hunting Agent<br/>IOCs, ATT&CK mapping, hypotheses]
-    C --> D[Detection Engineer Agent<br/>Sigma rule + test cases]
-    D --> E[Code Quality checks<br/>lint, schema, metadata]
-    E --> F[Validator<br/>rule tests, held-out logs]
-    F -- fail, retries left --> D
-    F --> G[Pull Request opened on GitHub]
-    G --> H[GitHub Actions CI<br/>lint, test, sigma check, convert to KQL]
-    H --> I{Human approves PR<br/>and deployment?}
-    I -- yes --> J[CD: deploy analytics rule to Sentinel]
-    I -- no --> D
-    J --> K[Synthetic or Atomic telemetry fires alert]
-    K --> L[Sentinel automation rule + playbook]
-    L --> S[SOAR Response Agent<br/>enrich, score confidence, propose action]
-    S --> M{Human approves containment?}
-    M -- yes --> N[Simulated Firewall API: block IP]
-    N --> O[Verify block, audit log, rollback]
-    M -- no --> P[Close incident with rationale]
-```
+1. [Learning outcomes](#1-learning-outcomes)
+2. [Scope and roadmap](#2-scope-and-roadmap)
+3. [Prerequisites](#3-prerequisites)
+4. [Architecture](#4-architecture)
+5. [Conventions](#5-conventions)
+6. [Phase 0: Setup](#6-phase-0-setup)
+7. [Phase 1: Detection-as-code](#7-phase-1-detection-as-code)
+8. [Phase 2: SOAR with the Sentinel playbook generator](#8-phase-2-soar-with-the-sentinel-playbook-generator)
+9. [Phase 3: Threat intel matching](#9-phase-3-threat-intel-matching)
+10. [Phase 4: Build your own security agents](#10-phase-4-build-your-own-security-agents)
+11. [Stretch goals](#11-stretch-goals)
+12. [Spec-driven workflow with OpenSpec](#12-spec-driven-workflow-with-openspec)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Costs, safety and teardown](#14-costs-safety-and-teardown)
+15. [Project checklist](#15-project-checklist)
 
-This diagram shows the finished core system. Section 9 builds it up one slice at a time, and Slice 9 adds parallel, supervisor and agent-to-agent extensions on top.
+---
 
-### Example run: `CVE-2021-44228` (Log4Shell)
+## 1. Learning outcomes
 
-1. Researcher pulls the NVD record, checks CISA KEV, and looks up ATT&CK techniques.
-2. Hunting agent extracts IOCs (`${jndi:ldap://...}` patterns, callback domains/IPs) from sourced reports and maps them to ATT&CK (e.g. T1190, T1059, T1105).
-3. Hypothesis: a Java process spawns a shell or makes an unexpected outbound LDAP/RMI connection.
-4. Detection agent writes a Sigma rule (child process of `java` running `sh`/`bash`/`curl`/`wget`) plus positive and negative test logs.
-5. PR is opened; CI lints, runs tests, validates the Sigma schema, and converts to KQL.
-6. You review and merge, then approve the deployment; CD deploys it to Sentinel as a scheduled analytics rule.
-7. Synthetic Java process events are ingested into `LinuxProcess_CL`; the alert fires.
-8. An automation rule triggers the playbook; the SOAR agent proposes blocking the synthetic external IP; you approve; the simulated firewall blocks it; the agent verifies and records an audit entry.
-
-### Example run 2: `CVE-2026-88771` (Citrix NetScaler ADC/Gateway)
-
-Chosen from the advisory set `CVE-2026-88771` to `CVE-2026-88778` (Citrix bulletin CTX697096). Values below come from NVD as of 2026-10-17; the Researcher agent re-checks them on every run.
-
-| Field | Value |
+| Area | By the end you can |
 |---|---|
-| Weakness | Improper input validation (CWE-20) |
-| Impact | Unauthenticated remote command execution |
-| CVSS v3.1 | 9.8 Critical (`AV:N/AC:L/PR:N/UI:N`) |
-| CISA KEV | Yes, added 2026-09-27, due 2026-09-30 |
-| SSVC | Exploitation: active, automatable: yes, technical impact: total |
-| Affected | NetScaler ADC and Gateway before 14.1-73.37 and before 13.1-64.23 (plus FIPS/NDcPP builds) |
-
-**Why this one**
-- It is the only one in the set that is both actively exploited (KEV, SSVC "active") and unauthenticated command execution, so it has the clearest hunting hypothesis.
-- `CVE-2026-88772` is also in KEV, but it is a memory-corruption bug (CWE-119) with high attack complexity. It is hard to detect from behaviour and a poor first rule.
-- `CVE-2026-88773` (request smuggling) and `88774` to `88778` (overflow, policy bypass, predictable values) are not in KEV or have no exploitation evidence, and mostly cause DoS or information exposure.
-
-**Pipeline walkthrough**
-1. Researcher pulls the NVD record, confirms KEV status, and collects the vendor advisory and public reports.
-2. Hunting agent extracts IOCs only from sourced reports (the NVD record itself lists none), and proposes ATT&CK mappings such as T1190 (exploit public-facing application) and T1059 (command execution) for review.
-3. Hypotheses:
-   - A NetScaler appliance receives an unusual request, then spawns a shell or an unexpected child process.
-   - The appliance makes an unexpected outbound connection to an external IP after an inbound request.
-4. Detection agent writes a Sigma rule with positive and negative synthetic logs.
-5. CI, human approval, and Sentinel deployment follow the same path as example 1.
-6. SOAR agent proposes blocking the synthetic source IP; you approve; the simulated firewall blocks it; the agent verifies and audits.
-
-**Lab caveat:** a NetScaler appliance does not run Atomic Red Team or Azure Monitor Agent. Replay synthetic syslog/CEF events into a custom Sentinel table instead, and use a generic Linux web-server process-creation test for the Atomic exercise.
-
-Compare both examples: Log4Shell has rich public IOCs and endpoint telemetry, while the Citrix case tests how the agents behave when IOCs are sparse and the data source is an appliance. In Slice 9 the Citrix case is also what the triage supervisor learns to route differently.
+| **Microsoft Sentinel** | Connect a data source, write and tune scheduled analytics rules, work incidents, use automation rules and workbooks |
+| **Microsoft Defender portal** | Run Sentinel from the Defender portal: incidents, automation rules, playbooks, integration profiles, and how Defender alerts and Sentinel incidents fit together |
+| **Detection rules** | Write KQL detections with full metadata (MITRE ATT&CK, severity, entity mappings) and unit-test them |
+| **Alert → incident** | Trigger a rule on purpose, trace it from raw log to alert to incident, and explain each step and its delay |
+| **SOAR** | Build a Python playbook with the Sentinel playbook generator that enriches, comments and remediates automatically, with least-privilege integrations |
+| **AI agents** | Build an agent from scratch (one LLM call → tools → loop → memory → evals) and put it into a real security workflow |
+| **Secure SDLC** | OIDC, protected environments, branch protection, CodeQL, Dependabot, secret scanning |
+| **Spec-driven development** | Plan each piece of work as an OpenSpec change: proposal → spec → tasks → build → archive |
 
 ---
 
-## 3. Agents
+## 2. Scope and roadmap
 
-| Agent | Kind | Built in | Responsibility | Inputs | Outputs |
-|---|---|---|---|---|---|
-| Threat Researcher | LLM | Slice 2 | Gather CVE facts from NVD, CISA KEV and ATT&CK | CVE ID | Structured CVE intel (CVSS, KEV status, affected products, references) |
-| Threat Hunting | LLM | Slice 3 (parallel in Slice 9) | Fetch threat reports, extract IOCs, map to MITRE ATT&CK, form hypotheses | CVE intel, reference URLs | IOC list with sources and confidence, ATT&CK techniques, hypotheses |
-| Detection Engineer | LLM | Slice 4 | Write Sigma rules and test cases | Hypotheses, IOCs | `rules/*.yml`, `tests/rules/*.json` |
-| Code Quality | Deterministic | Slice 4 | Check style, schema, secrets, rule metadata, unique rule IDs | Generated files | Pass/fail report with reasons |
-| Validator | Deterministic | Slice 0b (graph node in Slice 4, Atomic in Slice 6) | Run rule against positive/negative and held-out logs; record Atomic results | Rule, test data | Test report, detection and false-positive rates |
-| Evaluation | Deterministic (+ optional LLM judge) | Slice 2 | Score agent outputs (grounding, schema, hallucination) | Agent outputs, golden set | Eval metrics |
-| CI/CD | Deterministic | Slices 0a, 0b, 1b, 5 | Run checks, open PR, deploy and undeploy rules | Validated rule | PR, KQL artifact, deployment record |
-| SOAR Response | LLM | Slice 7 | Enrich incident, propose containment, execute after approval | Sentinel incident | Action proposal, execution result, audit entry, incident comment |
-| Triage Supervisor | LLM | Slice 9 | Decide what kind of detection a CVE needs and route to the right specialist | CVE intel | Route: endpoint, appliance/network, or no behavioural rule |
+### Roadmap
 
-"Deterministic" nodes are plain Python graph nodes or tools, not LLM calls. Use an LLM only where reasoning over unstructured text is needed.
-
-Human-in-the-loop gates: PR review, deployment approval (protected GitHub Environment), and containment approval (SOAR).
-
----
-
-## 4. Agent patterns used
-
-The project introduces one orchestration pattern at a time, matching the concepts in [notes/01-agents-concepts.md](notes/01-agents-concepts.md).
-
-| Pattern | Where | Slice |
+| Phase | Outcome | Rough effort* |
 |---|---|---|
-| Single agent | Researcher: CVE ID in, structured intel out | 2 |
-| Sequential | Researcher → Hunter → Detection Engineer → Quality → Validator | 3, 4 |
-| Bounded loop | Validator errors go back to the Detection Engineer, with a retry limit | 4 |
-| Human-in-the-loop | PR review, deployment approval, containment approval | 5, 7 |
-| Parallel (fan-out / fan-in) | Hunter analyses each threat report in parallel; a merge node deduplicates IOCs. Batch runs over several CVEs | 9 |
-| Supervisor / router | Triage agent routes a CVE to an endpoint or appliance detection specialist, or stops with "no behavioural rule" | 9 |
-| Agent as API | SOAR agent runs as its own FastAPI service called by a Sentinel playbook | 7 |
-| Agent-to-agent (A2A) | Detection pipeline and SOAR agent are separate services that exchange context over the A2A protocol | 9 |
-| MCP | NVD, KEV, ATT&CK and Sigma tools exposed as an MCP server any agent client can use | 9 |
+| **0. Setup** | Activity logs flow into Sentinel in the Defender portal; GitHub deploys to Azure with OIDC | 1 week |
+| **1. Detection-as-code** | Rule 1 (resource group deleted) is tested in CI, deployed by CD, and fires on a real deletion | 2 weeks |
+| **2. SOAR** | Rule 2 (NSG opened to the internet) fires, and a generated playbook comments, tags and removes the bad NSG rule | 2 weeks |
+| **3. Threat intel** | One free feed is ingested; Rule 3 matches indicators against Azure activity | 1–2 weeks |
+| **4.0 Agent foundations** | A minimal agent loop written by hand, with tools, limits, logging and tests | 1 week |
+| **4.1 Incident Triage Agent** | Classifies lab incidents, explains its verdict, learns from analyst feedback | 2 weeks |
+| **4.2 Threat Intel Briefing Agent** | Weekly briefing of new exploited CVEs and feed activity relevant to *your* environment | 1–2 weeks |
+| **4.3 Detection Engineering Agent** | A CVE file in the repo becomes a pull request with a rule and tests, or a "data gap" issue | 3 weeks |
 
----
-
-## 5. Target architecture
-
-This is the end state of the core system. Section 9 builds it up slice by slice, each with its own smaller diagram.
+\*At about 6–8 hours a week. Each phase must work end to end, with evidence (screenshots, run links, incident IDs), before the next one starts.
 
 ```mermaid
 flowchart LR
-    subgraph Repo[GitHub Repository]
-        SRC[Python + LangGraph]
-        RULES[Sigma rules]
-        TESTS[Tests + held-out logs]
-        GHA[GitHub Actions]
+    P0[0 Setup] --> P1[1 Detection-as-code] --> P2[2 SOAR] --> P3[3 Threat intel]
+    P3 --> A0[4.0 Agent foundations]
+    A0 --> A1[4.1 Triage agent]
+    A1 --> A2[4.2 TI briefing agent]
+    A2 --> A3[4.3 Detection engineering agent]
+    A2 -. writes CVE files .-> A3
+    A3 -. PRs go through .-> P1
+```
+
+### Out of scope (for now)
+
+- Virtual machines, endpoint telemetry, Atomic Red Team. Every rule here uses the Azure Activity log, which is free to ingest into Sentinel and needs no VM.
+- Sigma and rule conversion. Rules are native Sentinel YAML + KQL.
+- Agents that take actions on their own. All agents here are read-only or propose changes through pull requests.
+- Multi-agent orchestration frameworks. Agents are plain Python first (see [stretch goals](#11-stretch-goals)).
+
+An earlier, larger design (CVE → multi-agent pipeline → Sigma → Sentinel) is parked in [project_ideas/01-cve-to-rule](project_ideas/01-cve-to-rule/README.md). Phase 4.3 brings back its core idea in a smaller form.
+
+---
+
+## 3. Prerequisites
+
+### Accounts
+
+| Need | Notes |
+|---|---|
+| Azure subscription | Pay-as-you-go or a free trial, with **Owner** rights. Dedicated to this lab |
+| Microsoft Entra ID | The free tier that comes with the subscription is enough. You need rights to create app registrations and grant admin consent |
+| Microsoft Defender portal access | security.microsoft.com, with the Sentinel workspace connected. Defender unified RBAC permission **Automation Playbooks (Read and Write)** for Phase 2 |
+| GitHub account | A repository for this project (public or private) |
+| LLM API key (Phase 4) | Any provider with tool calling. Examples use Claude (e.g. `claude-sonnet-5-5`); set a monthly spend limit |
+| Optional enrichment keys (Phase 4) | VirusTotal and/or AbuseIPDB free tier |
+
+### Local tools
+
+| Tool | Version | Used for |
+|---|---|---|
+| Azure CLI (`az`) | latest | Setup, OIDC, testing |
+| Python | 3.11+ | Validation, tests, deploy scripts, agents |
+| Git + GitHub CLI (`gh`) | latest | Repo, PRs, environments |
+| Node.js | 20.19+ | OpenSpec CLI |
+| VS Code + extensions | - | Bicep, YAML, Kusto, Python |
+
+### Knowledge assumed
+
+Basic Azure portal navigation, Git branching and pull requests, and beginner Python. KQL is learned along the way; the [Must Learn KQL](https://github.com/rod-trent/MustLearnKQL) series is a good companion.
+
+---
+
+## 4. Architecture
+
+```mermaid
+flowchart LR
+    subgraph GH[GitHub]
+        PR[Pull request] --> CI[CI: lint, schema,<br/>KQL unit tests]
+        CI --> MAIN[Merge to main]
+        MAIN --> CD[CD: deploy<br/>needs approval]
+        CVE[intel/cves/*.md] --> DEA[4.3 Detection<br/>Engineering Agent]
+        DEA -->|opens| PR
+        TIB[4.2 TI Briefing Agent<br/>scheduled] -->|writes| CVE
     end
-    subgraph Azure[Personal Azure subscription]
-        ENTRA[Entra ID<br/>OIDC federation]
-        SENT[Microsoft Sentinel<br/>Log Analytics workspace]
-        DCR[DCR + custom tables]
-        PB[Logic App playbook<br/>managed identity]
+    subgraph AZ[Azure + Defender portal]
+        ACT[Azure Activity log] --> LAW[Log Analytics workspace<br/>+ Microsoft Sentinel]
+        TI[Threat feed] --> LAW
+        LAW --> RULE[Analytics rules]
+        RULE --> ALR[Alert / incident]
+        ALR --> AR[Automation rule<br/>enhanced alert trigger]
+        AR --> PB[Generated playbook<br/>Python]
+        PB -->|integration profile| TRI[4.1 Triage Agent<br/>Azure Function]
+        TRI -->|comment| ALR
+        PB -->|integration profile| RES[rg-lab-targets]
     end
-    subgraph Lab[Lab environment]
-        VM[Linux test VM<br/>Atomic Red Team]
-        SOAR[SOAR agent<br/>FastAPI]
-        FW[Simulated Firewall API<br/>FastAPI]
-    end
-    LLM[LLM provider]
-    SRC <--> LLM
-    SRC --> RULES
-    GHA -->|OIDC token| ENTRA
-    GHA -->|deploy on approval| SENT
-    GHA -->|synthetic logs| DCR
-    VM -->|Azure Monitor Agent| SENT
-    DCR --> SENT
-    SENT -->|incident| PB
-    PB --> SOAR
-    SOAR -->|approved block| FW
+    USER((Analyst)) -->|delete RG /<br/>open NSG| RES
+    RES -.activity.-> ACT
+    CI -->|OIDC, read-only| LAW
+    CD -->|OIDC, Sentinel Contributor| RULE
 ```
 
 ### Design principles
 
-- Agents are LangGraph nodes with typed state (Pydantic models) and structured outputs.
-- Every LLM output is schema-validated; no free text flows between agents.
-- Deterministic tools (NVD client, Sigma converter, test runner, Sentinel client) are separate from LLM reasoning.
-- Human approval is a graph interrupt or a protected environment, not a prompt convention.
-- Every identity gets only the role it needs, scoped as narrowly as Azure allows. No stored secrets.
-- All deployments and SOAR actions are idempotent, logged, and reversible.
+- **Everything that can be code is code.** Rules, infrastructure and agent code live in Git and are deployed by the pipeline. Generated playbooks are authored in the Defender portal; their Python code and documentation are copied into the repo for review and history (see [8.6](#86-keep-the-playbook-in-git)).
+- **No stored secrets where avoidable.** GitHub uses OIDC; Azure Functions use managed identities; API keys live in Key Vault. The one exception is the client secret an integration profile needs, which is short-lived and scoped narrowly.
+- **Least privilege.** Each identity gets only the role it needs at the narrowest scope.
+- **Humans approve risky steps.** Production deploys use a protected environment; agents propose, humans merge.
+- **Test against reality.** Synthetic test data is checked against real events from your own workspace.
+- **Untrusted input stays untrusted.** Incident fields, resource names, threat reports and CVE text can contain attacker-controlled strings. Agents treat them as data, never as instructions.
+
+### Repository layout (target)
+
+```
+.github/workflows/
+  ci.yml                     # on PR: lint, schema check, KQL unit tests, agent evals
+  deploy.yml                 # on merge to main: deploy analytics rules
+  ti-ingest.yml              # Phase 3: scheduled feed upload
+  ti-briefing.yml            # Phase 4.2: scheduled briefing agent
+  detection-agent.yml        # Phase 4.3: runs when intel/cves/ changes
+config/
+  lab.env.example            # names and IDs used across scripts (no secrets)
+detections/
+  azure_activity/
+    rg_deletion.yaml
+    nsg_open_to_internet.yaml
+    ti_ip_match.yaml
+tests/
+  detections/                # one *.test.yaml per rule
+schemas/
+  AzureActivity.yaml         # columns available in this lab (the "data contract")
+  ThreatIntelIndicators.yaml
+playbooks/
+  nsg-remediate/
+    prompt.md                # the natural-language spec given to the generator
+    playbook.py              # copy of the generated code, reviewed in a PR
+    README.md                # generated documentation + flow diagram
+    automation-rule.md       # trigger conditions as configured in the portal
+  ti-match-enrich/
+  triage-agent-call/
+workbooks/
+infra/                       # Bicep: diagnostic settings, roles, Key Vault, Function App
+scripts/
+  validate.py                # schema + metadata checks
+  run_kql_tests.py           # runs rule KQL against test data in the workspace
+  deploy_rules.py            # YAML -> Sentinel REST API (idempotent PUT)
+  ti_upload.py               # Phase 3
+agents/
+  core/                      # 4.0: LLM client, tool registry, loop, logging
+  triage/                    # 4.1
+  ti_briefing/               # 4.2
+  detection_engineer/        # 4.3
+  evals/                     # golden sets + eval runner
+intel/
+  cves/                      # CVE input files for 4.3
+  inventory.yaml             # technologies in your environment, for 4.2
+briefings/                   # 4.2 output
+docs/
+  detection-style.md         # how rules in this repo are written (also used by 4.3)
+  evidence/                  # screenshots and run links per phase
+openspec/                    # specs and changes (section 12)
+notes/                       # learning notes
+project_ideas/               # parked ideas
+```
 
 ---
 
-## 6. Tech stack
+## 5. Conventions
 
-| Layer | Choice | Why |
+Placeholders used throughout. Copy `config/lab.env.example` to `config/lab.env` (git-ignored) and fill it in.
+
+| Placeholder | Example | Meaning |
 |---|---|---|
-| Language | Python 3.11+ | Ecosystem for security and AI |
-| Agent orchestration | LangGraph | Stateful graphs, parallel branches, human-in-the-loop interrupts |
-| LLM | OpenAI / Azure OpenAI / Anthropic / Ollama (configurable) | Swap via env var; Ollama for free local runs |
-| Config | pydantic-settings | Pinned model version, per-call and per-run token caps |
-| Data models | Pydantic v2 | Validation of agent I/O |
-| Intel sources | NVD API 2.0, CISA KEV JSON, MITRE ATT&CK (STIX), public reports | Free and authoritative |
-| Detection format | Sigma | Vendor-neutral, large public rule set (SigmaHQ) |
-| Rule conversion | pySigma + `pySigma-backend-kusto`, `sigma-cli` | Sigma to KQL |
-| Rule testing | Sigma converted to SQLite (`pySigma-backend-sqlite`) or Zircolite, run against JSON logs | Fast local rule tests in CI |
-| SIEM | Microsoft Sentinel (Log Analytics) | Target platform |
-| Ingestion | Logs Ingestion API, DCR, custom `_CL` tables | Synthetic and appliance telemetry |
-| Identity | Entra ID app registration with OIDC federated credentials, Azure RBAC, managed identities | No static credentials, least privilege |
-| SOAR | Sentinel automation rules + Logic App playbook, FastAPI SOAR agent, FastAPI simulated firewall (Docker) | Real playbook flow, safe containment |
-| Emulation | Atomic Red Team + Invoke-AtomicRedTeam | Realistic test telemetry |
-| Multi-agent extensions | LangGraph `Send` (fan-out), A2A protocol (`a2a-sdk`), MCP Python SDK | Parallel, agent-to-agent, shared tools |
-| Testing | pytest, pytest-cov, hypothesis | Unit and property tests |
-| Quality | ruff, mypy, bandit, pre-commit | Lint, types, security |
-| Eval | pytest-based golden sets, SigmaHQ rules tagged with CVEs, optional promptfoo / DeepEval | LLM output quality |
-| CI/CD | GitHub Actions with protected Environments | Pipeline and approvals |
-| IaC | Bicep | Workspace references, tables, DCR, analytics rules, playbooks |
-| Containers | Docker, docker-compose | Reproducible lab |
-| Observability | structlog, LangSmith or Phoenix (optional) | Tracing agent runs |
+| `<SUBSCRIPTION_ID>` | `00000000-...` | Lab subscription |
+| `<TENANT_ID>` | `00000000-...` | Entra tenant |
+| `<LOCATION>` | `australiaeast` | Azure region |
+| `<RG_SENTINEL>` | `rg-sentinel-lab` | Workspace and Function App |
+| `<RG_TARGETS>` | `rg-lab-targets` | Things you break on purpose |
+| `<WORKSPACE>` | `law-sentinel-lab` | Log Analytics workspace name |
+| `<WORKSPACE_ID>` | `00000000-...` | Workspace *customer ID* (used for queries) |
+| `<GH_REPO>` | `your-user/sentinel-dac-lab` | GitHub `owner/repo` |
+
+Other conventions:
+
+- Rule IDs are fixed GUIDs, generated once (`python -c "import uuid; print(uuid.uuid4())"`) and never reused.
+- Rule `status` lifecycle: `experimental` (deploys disabled) → `test` (enabled) → `stable`.
+- Branch names: `feat/<change-name>`, matching the OpenSpec change name.
+- Each phase ends with a short write-up in `notes/` and evidence in `docs/evidence/phase-N/`.
 
 ---
 
-## 7. Repository layout
+## 6. Phase 0: Setup
 
+**Goal:** Azure activity reaches Sentinel, Sentinel is used from the Defender portal, and GitHub can talk to Azure safely.
+
+### Steps
+
+**0.1 Sign in and create resource groups**
+
+```bash
+az login
+az account set --subscription <SUBSCRIPTION_ID>
+az group create -n <RG_SENTINEL> -l <LOCATION>
+az group create -n <RG_TARGETS>  -l <LOCATION>
 ```
-cve_to_rule/
-├── README.md
-├── pyproject.toml
-├── .pre-commit-config.yaml
-├── .env.example
-├── docker-compose.yml
-├── notes/                     # weekly lesson notes (01-agents-concepts.md, ...)
-├── src/cve2rule/
-│   ├── cli.py                 # entry point: cve2rule research CVE-2021-44228
-│   ├── config.py              # model name, token caps, provider settings
-│   ├── graph.py               # LangGraph workflow
-│   ├── state.py               # Pydantic state models
-│   ├── agents/
-│   │   ├── researcher.py
-│   │   ├── hunter.py
-│   │   ├── detection_engineer.py
-│   │   ├── code_quality.py
-│   │   ├── validator.py
-│   │   ├── evaluator.py
-│   │   ├── soar.py
-│   │   └── triage.py          # Slice 9 supervisor
-│   ├── tools/
-│   │   ├── nvd.py
-│   │   ├── cisa_kev.py
-│   │   ├── attack.py
-│   │   ├── sigma_convert.py
-│   │   ├── github_pr.py
-│   │   └── sentinel.py
-│   ├── services/
-│   │   ├── soar_api.py        # SOAR agent as a FastAPI service (Slice 7)
-│   │   ├── a2a/               # A2A agent cards and handlers (Slice 9)
-│   │   └── mcp_server.py      # tools exposed over MCP (Slice 9)
-│   └── prompts/
-├── rules/                     # Sigma rules (hand-written first, later generated)
-├── pipelines/                 # custom pySigma pipelines: Sigma fields -> table columns
-├── deploy/                    # rule packaging and Sentinel sync scripts
-├── tests/
-│   ├── unit/
-│   ├── rules/                 # rule tests with synthetic logs
-│   │   └── holdout/           # human-written logs, never shown to generators
-│   ├── evals/                 # LLM golden-set evals
-│   └── data/
-├── lab/
-│   ├── firewall_api/          # simulated firewall
-│   ├── atomic/                # Atomic Red Team runbooks
-│   ├── playbooks/             # Logic App playbooks (Bicep)
-│   └── infra/                 # Bicep: tables, DCR, role assignments, schemas
-├── docs/
-└── .github/workflows/
-    ├── ci.yml                 # lint, test, rule validation, KQL build
-    ├── eval.yml               # LLM evals (scheduled / manual)
-    └── deploy.yml             # sync rules to Sentinel after approval
+
+Keep the workspace in its own resource group so it is never deleted by accident during testing.
+
+**0.2 Workspace and Sentinel** (skip if you already have a Sentinel workspace)
+
+```bash
+az monitor log-analytics workspace create -g <RG_SENTINEL> -n <WORKSPACE> -l <LOCATION>
+az extension add --name sentinel
+az sentinel onboarding-state create -g <RG_SENTINEL> --workspace-name <WORKSPACE> --name default
 ```
+
+Or add Microsoft Sentinel to the workspace in the Azure portal.
+
+**0.3 Connect the workspace to the Defender portal**
+
+In security.microsoft.com, connect the Sentinel workspace (the portal prompts you on first visit, or use the Sentinel workspace settings) and make it the primary workspace. Do all daily work there from now on; the playbook generator in Phase 2 is only available in the Defender portal. Check that **Microsoft Sentinel → Configuration → Automation** is visible.
+
+**0.4 Send the subscription Activity log to the workspace**
+
+Either install the *Azure Activity* solution from Sentinel Content hub and follow its connector page (it creates the diagnostic setting through Azure Policy), or create the diagnostic setting directly:
+
+```bash
+WS_RESOURCE_ID=$(az monitor log-analytics workspace show -g <RG_SENTINEL> -n <WORKSPACE> --query id -o tsv)
+az monitor diagnostic-settings subscription create \
+  --name activity-to-sentinel --location <LOCATION> \
+  --workspace "$WS_RESOURCE_ID" \
+  --logs '[{"category":"Administrative","enabled":true},{"category":"Security","enabled":true},{"category":"Policy","enabled":true},{"category":"Alert","enabled":true}]'
+```
+
+Install the Azure Activity solution anyway; it brings rule templates and a workbook worth reading.
+
+Check (data can take 10–15 minutes to appear the first time):
+
+```kql
+AzureActivity
+| where TimeGenerated > ago(1h)
+| summarize count() by OperationNameValue, ActivityStatusValue
+| top 20 by count_
+```
+
+**0.5 Budget**
+
+In Cost Management, create a subscription budget with an email alert at a low amount (for example 10 in your currency) at 50%, 80% and 100%.
+
+**0.6 GitHub repository hygiene**
+
+- Branch protection on `main`: pull request required, CI must pass, no direct pushes.
+- Environment `production` with yourself as **required reviewer**.
+- Turn on Dependabot alerts and updates, CodeQL code scanning (Python), and secret scanning with **push protection**.
+
+**0.7 GitHub → Azure with OIDC**
+
+Create two identities so pull-request code can never deploy:
+
+```bash
+# CI identity: read-only, used on pull requests
+CI_APP=$(az ad app create --display-name gh-sentinel-ci --query appId -o tsv)
+az ad sp create --id $CI_APP
+az ad app federated-credential create --id $CI_APP --parameters '{
+  "name": "gh-pr", "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:<GH_REPO>:pull_request", "audiences": ["api://AzureADTokenExchange"]}'
+az role assignment create --assignee $CI_APP --role "Log Analytics Reader" --scope "$WS_RESOURCE_ID"
+
+# Deploy identity: only usable from the protected production environment
+CD_APP=$(az ad app create --display-name gh-sentinel-deploy --query appId -o tsv)
+az ad sp create --id $CD_APP
+az ad app federated-credential create --id $CD_APP --parameters '{
+  "name": "gh-prod", "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:<GH_REPO>:environment:production", "audiences": ["api://AzureADTokenExchange"]}'
+RG_ID=$(az group show -n <RG_SENTINEL> --query id -o tsv)
+az role assignment create --assignee $CD_APP --role "Microsoft Sentinel Contributor" --scope "$RG_ID"
+```
+
+| Identity | Role | Scope | Used by |
+|---|---|---|---|
+| `gh-sentinel-ci` | Log Analytics Reader | Workspace | KQL unit tests on PRs |
+| `gh-sentinel-deploy` | Microsoft Sentinel Contributor | `<RG_SENTINEL>` | Deploying analytics rules |
+
+Store **IDs only** as GitHub variables or secrets: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CI_CLIENT_ID`, `AZURE_CD_CLIENT_ID`, `WORKSPACE_ID`. No client secrets in GitHub.
+
+**0.8 Smoke-test workflow**
+
+```yaml
+# .github/workflows/oidc-smoke.yml
+name: oidc-smoke
+on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  whoami:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CD_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: az account show --query "{sub:id, user:user.name}"
+```
+
+### Done when
+
+- [ ] The KQL check in 0.4 returns rows, both in the Azure portal and in the Defender portal (Advanced hunting).
+- [ ] `oidc-smoke` succeeds after you approve it in the `production` environment.
+- [ ] Budget alert, branch protection, push protection and CodeQL are on.
+
+### Learning checkpoint
+
+- What is the difference between the workspace resource ID and the workspace (customer) ID, and which one does each tool need?
+- Why does the federated credential `subject` matter, and what stops a pull request from using the deploy identity?
+- What changes when Sentinel is used from the Defender portal instead of the Azure portal?
 
 ---
 
-## 8. CI/CD pipeline
+## 7. Phase 1: Detection-as-code
 
-```mermaid
-flowchart LR
-    PR[Pull request] --> L[Lint: ruff, mypy, bandit]
-    L --> U[Unit tests]
-    U --> R[Sigma check + rule tests<br/>incl. held-out logs]
-    R --> C[Convert to KQL<br/>artifact + job summary]
-    C --> M[Merge to main]
-    M --> A{Approval<br/>sentinel-lab environment}
-    A --> O[OIDC login to Azure]
-    O --> D[Sync rules to Sentinel<br/>create / update / delete]
-    D --> S[Replay synthetic logs]
-    S --> V[Post-deploy check<br/>alert fired?]
+**Goal:** one rule goes through the full lifecycle: write → test → PR → CI → approve → deploy → trigger → incident.
+
+### 7.1 Rule format
+
+Rules use the YAML layout of the [Azure-Sentinel GitHub repo](https://github.com/Azure/Azure-Sentinel/tree/master/Detections), so they are familiar to anyone who works with Sentinel. The KQL lives inside the YAML with all the metadata.
+
+Why YAML rather than ARM JSON: it is easy to read and review in a pull request, the query is not escaped inside a JSON string, and it matches the community format. `deploy_rules.py` converts it to the Sentinel REST API body at deploy time. (Sentinel's built-in *Repositories* feature accepts only ARM/Bicep, which is why this lab has its own pipeline.)
+
+Write the conventions down in `docs/detection-style.md`: required fields, naming, how `queryPeriod` and `ingestion_time()` are used, entity mapping rules. The Phase 4.3 agent will read this file too.
+
+### 7.2 Rule 1: Resource group deleted
+
+`detections/azure_activity/rg_deletion.yaml`
+
+```yaml
+id: 3f6c1a52-8e0b-4b8e-9a1d-6f2a9c4d7e10   # fixed GUID; also the rule's resource name in Sentinel
+name: Azure resource group deleted
+description: |
+  A resource group was deleted. Deleting a resource group removes every resource in it,
+  so it can be destructive activity by an attacker (T1485) or a costly mistake.
+severity: Medium
+status: test                     # experimental -> test -> stable
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActivity
+    dataTypes:
+      - AzureActivity
+queryFrequency: 5m
+queryPeriod: 30m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Impact
+relevantTechniques:
+  - T1485
+query: |
+  // queryPeriod is longer than queryFrequency so late-arriving Activity log events are not missed;
+  // the ingestion_time() filter stops the same event alerting on more than one run.
+  AzureActivity
+  | where ingestion_time() > ago(5m)
+  | where OperationNameValue =~ "MICROSOFT.RESOURCES/SUBSCRIPTIONS/RESOURCEGROUPS/DELETE"
+  | where ActivityStatusValue in~ ("Success", "Succeeded")
+  | summarize arg_min(TimeGenerated, *) by CorrelationId
+  | project TimeGenerated, Caller, CallerIpAddress, SubscriptionId, ResourceGroup, CorrelationId, _ResourceId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Caller
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: CallerIpAddress
+  - entityType: AzureResource
+    fieldMappings:
+      - identifier: ResourceId
+        columnName: _ResourceId
+incidentConfiguration:
+  createIncident: true
+version: 1.0.0
 ```
 
-This is the final pipeline. Slices 0a, 0b and 1b build it; later slices add stages they need (integration tests for the firewall API in Slice 7).
+### 7.3 Rule tests
 
-- `ci.yml` runs on every PR and never touches Azure or a real LLM.
-- `deploy.yml` runs on merge to `main` and uses the protected `sentinel-lab` GitHub Environment with you as required reviewer.
-- Azure auth uses OIDC federated credentials, not stored secrets.
-- LLM calls in CI are mocked; real-model evals run in `eval.yml` on schedule or manual dispatch.
+Each rule has a test file with sample rows and the number of results expected. `run_kql_tests.py`:
 
----
+1. Builds a `datatable` from the rows, using column types from `schemas/AzureActivity.yaml`.
+2. Prepends `let AzureActivity = datatable(...)[...];` so the rule's query reads the test rows instead of the real table.
+3. Replaces `ingestion_time()` with `TimeGenerated` (a datatable has no ingestion time).
+4. Runs the query against the workspace (`az monitor log-analytics query -w <WORKSPACE_ID> ...` or the `azure-monitor-query` Python SDK).
+5. Compares the row count with `expect_rows` and fails CI on any mismatch.
 
-## 9. Build plan: thin slice first
+`tests/detections/rg_deletion.test.yaml`
 
-Build a thin version of the whole pipeline first, then deepen one stage per slice. Every slice ends with a working, committed pipeline, so you always have something that runs end to end.
-
-The order puts detection-as-code on real Sentinel before any LLM agent. By the end of Slice 1b, a hand-written Sigma rule goes from Git to a live analytics rule. Every agent added after that just feeds more rules into a pipeline that already works.
-
-Rules for every slice:
-- Work on a branch, open a PR, and merge only when CI is green.
-- Each step produces working code and teaches one concept (*Learn:*).
-- A slice is finished only when its **Done when** check passes.
-- Anything not built yet stays manual (you do it by hand) or is skipped. Don't build stubs for future slices.
-
-```mermaid
-flowchart LR
-    S0A[0a<br/>Repo, CI, NVD client] --> S0B[0b<br/>Rule as code, KQL]
-    S0B --> S1A[1a<br/>Azure + identity]
-    S1A --> S1B[1b<br/>Sentinel CD]
-    S1B --> S2[2<br/>Researcher + evals]
-    S2 --> S3[3<br/>Hunting agent]
-    S3 --> S4[4<br/>Detection agent + graph]
-    S4 --> S5[5<br/>PR automation]
-    S5 --> S6[6<br/>Atomic Red Team]
-    S6 --> S7[7<br/>SOAR playbook]
-    S7 --> S8[8<br/>Hardening]
-    S8 --> S9[9<br/>Multi-agent extensions]
+```yaml
+rule: detections/azure_activity/rg_deletion.yaml
+cases:
+  - name: successful RG delete alerts once even with Start + Success events
+    expect_rows: 1
+    rows:
+      - { OperationNameValue: MICROSOFT.RESOURCES/SUBSCRIPTIONS/RESOURCEGROUPS/DELETE, ActivityStatusValue: Start,   CorrelationId: c1, Caller: analyst@lab.example }
+      - { OperationNameValue: MICROSOFT.RESOURCES/SUBSCRIPTIONS/RESOURCEGROUPS/DELETE, ActivityStatusValue: Success, CorrelationId: c1, Caller: analyst@lab.example }
+  - name: failed delete does not alert
+    expect_rows: 0
+    rows:
+      - { OperationNameValue: MICROSOFT.RESOURCES/SUBSCRIPTIONS/RESOURCEGROUPS/DELETE, ActivityStatusValue: Failure, CorrelationId: c2 }
+  - name: RG write does not alert
+    expect_rows: 0
+    rows:
+      - { OperationNameValue: MICROSOFT.RESOURCES/SUBSCRIPTIONS/RESOURCEGROUPS/WRITE, ActivityStatusValue: Success, CorrelationId: c3 }
 ```
 
-| Slice | Adds | Still manual or not yet built |
+**Ground the tests in reality:** before trusting synthetic rows, delete a test resource group once, export the real events (`AzureActivity | where CorrelationId == "<id>"`), and confirm the field names and status values match. Save a sanitised copy under `tests/fixtures/real/`.
+
+### 7.4 Validation rules (`validate.py`)
+
+| Check | Why |
+|---|---|
+| Required fields present (`id`, `name`, `severity`, `query`, `queryFrequency`, `queryPeriod`, `tactics`, `relevantTechniques`, `entityMappings`, `version`) | Sentinel rejects or misbehaves without them |
+| `id` is a GUID and unique across the repo | It is the resource name; duplicates overwrite each other |
+| Tactics and technique IDs are valid ATT&CK values | Bad metadata breaks coverage reporting |
+| `queryPeriod >= queryFrequency` | Otherwise events fall between runs |
+| Every entity-mapping column appears in the query's `project` | Otherwise entities are silently empty |
+| Every rule has a test file with at least one positive and one negative case | No untested rules |
+| `version` increases when `query` changes | Change tracking |
+
+### 7.5 Deployment (`deploy_rules.py`)
+
+For each changed YAML file, convert it to the REST body and `PUT`:
+
+```
+PUT https://management.azure.com/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RG_SENTINEL>
+    /providers/Microsoft.OperationalInsights/workspaces/<WORKSPACE>
+    /providers/Microsoft.SecurityInsights/alertRules/<rule id>?api-version=<latest stable>
+```
+
+| YAML field | REST `properties` field | Conversion |
 |---|---|---|
-| 0a | Tooling, branch protection, CI (lint, types, tests), NVD client, CLI | Everything with an LLM or Azure |
-| 0b | Table schema, custom pySigma pipeline, hand-written rule and held-out logs, rule tests, KQL artifact | Azure, agents |
-| 1a | Bicep for tables and DCR on your existing workspace, budget alert, Entra app with OIDC, scoped role assignments | Rule deployment, agents |
-| 1b | `deploy.yml`, rule packaging, create/update/delete sync, synthetic ingestion (endpoint and appliance), post-deploy check | Agents |
-| 2 | Config with token caps, Researcher agent, KEV and ATT&CK tools, eval harness, `eval.yml` | Hunting, rule writing |
-| 3 | Report fetcher, Hunting agent with sourced IOCs, two-node graph | Rule writing |
-| 4 | Detection Engineer agent, quality checks, validator node, retry loop, full graph | PRs (you commit by hand) |
-| 5 | Agent opens PRs into the Slice 1b pipeline | Real telemetry, SOAR |
-| 6 | Atomic Red Team VM and telemetry, parser to the shared schema | SOAR |
-| 7 | Simulated firewall, SOAR agent service, automation rule + playbook, approval, rollback | Nothing in the core |
-| 8 | Guardrails, observability, security review, demo | Extensions |
-| 9 | Parallel hunting, triage supervisor, A2A between pipeline and SOAR, MCP tool server | Nothing |
+| `name` | `displayName` | as is |
+| `queryFrequency: 5m` | `queryFrequency` | ISO 8601: `PT5M` |
+| `queryPeriod: 30m` | `queryPeriod` | `PT30M` |
+| `triggerOperator: gt` | `triggerOperator` | `GreaterThan` |
+| `relevantTechniques` | `techniques` / `subTechniques` | split `T1562.007` into both |
+| `status` | `enabled` | `false` when `experimental` |
+| `entityMappings`, `incidentConfiguration` | same names | as is |
 
-New components in each diagram below are drawn with a thick green border.
+Because the YAML `id` is the resource name, the `PUT` is idempotent: running it twice changes nothing. Deleting a YAML file deletes the rule, but only for rules the pipeline created (keep a manifest of deployed IDs, or tag the description with `[source: repo]`).
 
----
-
-### Slice 0a: Repo, CI and first tool (no LLM, no Azure)
-
-**Goal:** green CI and a CLI that prints a parsed NVD record.
+### 7.6 Pipeline
 
 ```mermaid
 flowchart LR
-    U[CLI<br/>cve2rule research CVE-ID]:::new --> NVD[NVD client<br/>deterministic]:::new
-    NVD --> P[Parsed CVE record<br/>printed as JSON]:::new
-    PR[Pull request] --> CI[GitHub Actions<br/>ruff, mypy, pytest]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
+    A[Branch + edit rule] --> B[Open PR]
+    B --> C[ci.yml]
+    C --> C1[yamllint]
+    C --> C2[validate.py]
+    C --> C3[run_kql_tests.py<br/>CI identity, read-only]
+    C1 & C2 & C3 --> D[Review + merge]
+    D --> E[deploy.yml<br/>waits for approval]
+    E --> F[deploy_rules.py<br/>PUT alertRules/rule-id]
+    F --> G[Smoke check:<br/>GET rule, enabled?]
 ```
 
-**Steps**
-1. **Repo and tooling**: `pyproject.toml`, virtualenv, ruff, mypy, pytest, pre-commit, `.env.example`. *Learn: project structure, dependency management.*
-2. **Branch protection**: protect `main`, require PRs and passing status checks. *Learn: SDLC, code review.*
-3. **First CI**: `ci.yml` runs ruff, mypy and one trivial test on every PR, with pip caching. *Learn: GitHub Actions triggers, jobs, caching.*
-4. **NVD client** (`tools/nvd.py`): fetch one CVE, parse it into a Pydantic model, handle rate limits and missing fields. Unit tests use recorded HTTP responses, never the live API. *Learn: API clients, test doubles.*
-5. **CLI** (`cli.py`): `cve2rule research CVE-2021-44228` prints the parsed record as JSON. *Learn: entry points.*
+- **`ci.yml`** runs on `pull_request`, logs in with the CI identity, and runs the three checks.
+- **`deploy.yml`** runs on push to `main`, uses `environment: production` (so it waits for approval), logs in with the deploy identity, deploys only changed files, then reads each rule back to confirm it exists and is enabled.
 
-**Done when:** `cve2rule research CVE-2021-44228` prints the parsed NVD record, and a PR gets green CI with ruff, mypy and pytest.
+### 7.7 Trigger it
+
+1. `az group create -n rg-lab-delete-me-01 -l <LOCATION>`
+2. `az group delete -n rg-lab-delete-me-01 --yes`
+3. Wait. Activity log events usually arrive within a few minutes, and the rule runs every 5 minutes, so expect roughly 5–20 minutes.
+4. Open the incident in the Defender portal. Check the entities: account, IP, resource.
+5. Write down the time of each step: delete → event `TimeGenerated` → `ingestion_time()` → alert → incident.
+
+### Done when
+
+- [ ] A PR that changes the rule passes CI, is merged, and is deployed after approval.
+- [ ] A real deletion creates exactly one incident with correct entities.
+- [ ] Evidence saved: PR link, workflow run links, incident screenshot, timing table.
+
+### Learning checkpoint
+
+- Why `ingestion_time()` and not just `TimeGenerated` for the 5-minute window?
+- What happens if the rule's lookback equals its frequency and an event arrives 8 minutes late?
+- Which fields would you allowlist to stop alerts from your own automation (for example, a CI pipeline that deletes temporary resource groups)?
 
 ---
 
-### Slice 0b: Rule as code (no LLM, no Azure)
+## 8. Phase 2: SOAR with the Sentinel playbook generator
 
-**Goal:** `hand-written Sigma rule → PR → CI → tested KQL file`, on a real table schema.
+**Goal:** a second rule whose alert starts a playbook automatically, with no human in between.
 
-The rule, the test logs, the KQL and (in Slice 1) the Sentinel table all have to agree on field names. This slice fixes the target table schema first and maps Sigma fields to it with one custom pipeline. The rule tests and the KQL conversion both use that pipeline, so CI tests the mapping and not only the rule logic.
+### 8.1 About the playbook generator
+
+The Defender portal has a **SOAR playbook generator** (Microsoft Sentinel → Configuration → Automation → Playbooks → Create → *Playbook Generator*). You describe the playbook in natural language to an AI coding agent in a VS Code editor embedded in the portal. It writes a plan, then Python code, documentation and a flow diagram, and can test the playbook against a real alert. Key points, from [Microsoft's documentation](https://learn.microsoft.com/en-us/azure/sentinel/automation/generate-playbook) at the time of writing:
+
+| Topic | What it means for this lab |
+|---|---|
+| **Requirements** | Workspace connected to the Defender portal; Defender RBAC *Automation Playbooks (Read and Write)*; *Microsoft Sentinel Contributor* to create automation rules. No separate Security Copilot licence needed. Permissions can take up to two hours to apply |
+| **Input** | **Alerts only.** The playbook receives the alert (with entities), not the incident |
+| **Trigger** | An automation rule with an **enhanced alert trigger** (conditions such as alert title or severity) whose action is *Run playbook* |
+| **Calling APIs** | Through **integration profiles**: base URL + authentication (OAuth2 client credentials, API key, bearer token and others). Microsoft Graph and Azure Resource Manager profiles must be created by hand |
+| **Limits** | Python only, no external libraries, 10-minute run time, no playbook-to-playbook calls. Generated playbooks are saved **disabled** |
+| **Monitoring** | Run results show in the incident's **Activities** tab (not in the Sentinel health table) |
+
+Check the current documentation before you start; the feature is new and changing. If it is not available in your tenant, the classic route (a Logic App playbook with the *Microsoft Sentinel incident* trigger) works for the same design.
+
+### 8.2 Rule 2: NSG rule allows admin ports from the internet
+
+Creating a network security group (NSG) costs nothing and needs no VM, so this can be triggered safely. An inbound rule that opens SSH or RDP to `*` or `Internet` is a classic misconfiguration and defence-evasion step (ATT&CK T1562.007 *Impair Defenses: Disable or Modify Cloud Firewall*), and it can be fixed automatically.
+
+`detections/azure_activity/nsg_open_to_internet.yaml`, query:
+
+```kql
+AzureActivity
+| where ingestion_time() > ago(5m)
+| where OperationNameValue =~ "MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE"
+| where ActivityStatusValue in~ ("Start", "Started", "Success", "Succeeded")
+// Rule settings sit in the request/response body. Check real field names in your own logs first.
+| extend body = todynamic(coalesce(tostring(Properties_d.requestbody), tostring(Properties_d.responseBody)))
+| extend r = body.properties
+| extend Access = tostring(r.access), Direction = tostring(r.direction),
+         Source = tostring(r.sourceAddressPrefix), DestPort = tostring(r.destinationPortRange)
+| where Access =~ "Allow" and Direction =~ "Inbound"
+| where Source in~ ("*", "0.0.0.0/0", "Internet", "Any")
+| where DestPort in ("22", "3389", "*")
+| summarize arg_min(TimeGenerated, *) by CorrelationId
+| project TimeGenerated, Caller, CallerIpAddress, ResourceGroup, NsgRuleId = _ResourceId, Source, DestPort, CorrelationId
+```
+
+Metadata: severity High, tactic `DefenseEvasion`, technique `T1562.007`, entities Account, IP, AzureResource (`NsgRuleId`). Rule 2 is deployed by the Phase 1 pipeline like any other rule.
+
+**First task of this phase:** create one open rule by hand, then look at the raw event to confirm where the rule settings appear (`requestbody` vs `responseBody`, and on which status). Adjust the query and tests to match.
+
+Known gaps to cover with tests, then either fix or document: port ranges (`20-30`), `destinationPortRanges` arrays, `sourceAddressPrefixes` arrays.
+
+### 8.3 Integration profiles and permissions
+
+The generated playbook calls Azure Resource Manager to delete the NSG rule and to comment on and tag the incident. Create one Entra app for the playbook and give it only what it needs:
+
+```bash
+PB_APP=$(az ad app create --display-name soar-playbook-lab --query appId -o tsv)
+az ad sp create --id $PB_APP
+az ad app credential reset --id $PB_APP --display-name integration-profile --years 0.25   # short-lived secret
+TARGETS_ID=$(az group show -n <RG_TARGETS> --query id -o tsv)
+az role assignment create --assignee $PB_APP --role "Network Contributor"          --scope "$TARGETS_ID"
+az role assignment create --assignee $PB_APP --role "Microsoft Sentinel Responder" --scope "$WS_RESOURCE_ID"
+```
+
+| Integration profile | Base URL | Auth | Used for |
+|---|---|---|---|
+| `arm-lab` | `https://management.azure.com` | OAuth2 client credentials, token endpoint `https://login.microsoftonline.com/<TENANT_ID>/oauth2/v2.0/token`, scope `https://management.azure.com/.default` | Delete NSG rule, comment/tag incident |
+| `graph-lab` | `https://graph.microsoft.com` | OAuth2 client credentials, scope `https://graph.microsoft.com/.default`, app permission `SecurityAlert.Read.All` (admin consent) | Read alert details (follow the setup in Microsoft's docs) |
+| `teams-webhook` (optional) | Your Teams/Slack incoming webhook URL | API key / none | Notification |
+
+Create them in **Microsoft Sentinel → Configuration → Automation → Integration Profiles**. The base URL and auth method cannot be changed later, so name them carefully.
+
+| Identity | Role | Scope | Why |
+|---|---|---|---|
+| `soar-playbook-lab` app | Network Contributor | `<RG_TARGETS>` only | Delete the bad NSG rule, nothing else |
+| `soar-playbook-lab` app | Microsoft Sentinel Responder | Workspace | Comment on and tag incidents |
+| You | Defender RBAC *Automation Playbooks (Read and Write)* + Microsoft Sentinel Contributor | Tenant / workspace | Create the playbook and automation rule |
+
+Integration profiles need a client secret, unlike the rest of the lab. Keep it short-lived (90 days), write its expiry in `notes/`, and rotate it.
+
+### 8.4 Generate the playbook `nsg-remediate`
+
+Write the request in `playbooks/nsg-remediate/prompt.md` first, review it like code, then paste it into the generator (Plan mode):
+
+```markdown
+Trigger: alerts from the analytics rule "NSG rule allows admin ports from the internet".
+
+1. Read the alert's AzureResource entity (the NSG security rule resource ID) and Account entity.
+2. Add a comment to the alert's incident: "Auto-triage started by nsg-remediate".
+3. Safety check: if the resource ID is not inside resource group rg-lab-targets
+   (case-insensitive match on /resourceGroups/rg-lab-targets/), comment
+   "Out of scope, manual review needed" and stop.
+4. Delete the NSG security rule with an ARM DELETE call using the arm-lab integration
+   (Microsoft.Network, current stable api-version).
+5. Poll GET on the same resource until it returns 404 (max 2 minutes). If it still exists, comment the failure and stop.
+6. Comment on the incident: which rule was removed, who created it, when, and the original settings.
+7. Add the tag "auto-remediated" to the incident.
+8. Optional: post a short summary to the teams-webhook integration.
+Never modify anything other than the single NSG rule named in the alert.
+```
+
+Then:
+
+1. Review the generator's **plan and flow diagram**. Ask for changes until the safety check (step 3) is clearly there.
+2. Switch to **Act mode** to generate the Python code and documentation.
+3. **Read the generated code yourself.** Check the scope check, error handling, and that it touches only one resource. Microsoft states there is no automatic code validation.
+4. Test it with a real alert ID from a manual trigger of Rule 2 (see 8.7). Approve the changes the generator lists before it runs.
+5. Save. The playbook is saved **disabled**; enable it in **Active Playbooks**.
+
+Build it in two steps, like any automation:
+
+- **2a. Comment only:** steps 1, 2, 6 (without deletion), 7. Proves trigger → playbook → incident works.
+- **2b. Remediate:** add steps 3–5 and test both the in-scope and the out-of-scope case.
+
+### 8.5 Automation rule (enhanced alert trigger)
+
+In **Automation → Automation Rules → Create**:
+
+| Setting | Value |
+|---|---|
+| Trigger | Enhanced alert trigger |
+| Conditions | Alert title / analytics rule name equals *NSG rule allows admin ports from the internet* |
+| Workspaces | The lab workspace |
+| Action | Run playbook → `nsg-remediate` |
+
+Record the exact settings in `playbooks/nsg-remediate/automation-rule.md`.
+
+### 8.6 Keep the playbook in Git
+
+The generator stores the playbook in the Defender portal and there is no documented CI/CD deployment for it yet. To keep a reviewable history:
+
+- Copy the final Python code to `playbooks/nsg-remediate/playbook.py` and the generated documentation to `playbooks/nsg-remediate/README.md`.
+- Open a PR for every change. CI runs `ruff` and a few unit tests of the pure functions (for example the scope check) with mocked API calls.
+- Treat the repo copy as the source of truth: change it in the PR first, then apply the same change in the portal.
+
+If Microsoft adds an API or export for generated playbooks, move deployment into `deploy.yml`.
+
+### 8.7 Trigger it
+
+```bash
+az network nsg create -g <RG_TARGETS> -n nsg-lab-01
+az network nsg rule create -g <RG_TARGETS> --nsg-name nsg-lab-01 -n allow-ssh-any \
+  --priority 100 --direction Inbound --access Allow --protocol Tcp \
+  --source-address-prefixes '*' --destination-port-ranges 22
+```
+
+Then wait, and watch the incident's Activities tab, the incident comments and the NSG.
+
+For the out-of-scope test, create a second resource group `rg-lab-outside`, add the same NSG rule there, and confirm the playbook comments "out of scope" and deletes nothing.
+
+### 8.8 Optional: workbook
+
+`workbooks/detection-lab.json`: incidents per rule over time, event-to-incident delay, playbook outcomes (parsed from incident comments and tags). Deployed as an ARM resource by the pipeline.
+
+### Done when
+
+- [ ] Adding `allow 22 from *` in `<RG_TARGETS>` results, with no further action, in the NSG rule being removed and the incident having comments and the `auto-remediated` tag.
+- [ ] The same change in `rg-lab-outside` is **not** remediated.
+- [ ] `prompt.md`, `playbook.py`, the generated docs and `automation-rule.md` are in the repo through a reviewed PR.
+- [ ] Evidence saved: incident Activities tab, comments, before/after NSG screenshots.
+
+### Learning checkpoint
+
+- The generator wrote the code. What did you check before enabling it, and what would you check in a real company?
+- Why does the playbook work on alerts rather than incidents, and when does that matter?
+- What could go wrong with automatic remediation in production, and what extra safeguards would you add (approval step, change window, allowlist)?
+
+---
+
+## 9. Phase 3: Threat intel matching
+
+**Goal:** ingest one free threat feed on a schedule, and alert when Azure activity comes from a listed indicator.
+
+### Steps
+
+1. **Pick one feed.** For example the abuse.ch **Feodo Tracker** IP blocklist (small, well maintained) or **ThreatFox** IOCs. One feed only.
+2. **Ingest it.** Choose one:
+   - The *Threat Intelligence – TAXII* data connector, if your feed offers TAXII.
+   - A scheduled job (`.github/workflows/ti-ingest.yml` running `scripts/ti_upload.py`) that downloads the feed and sends STIX indicators to Sentinel's threat intelligence **upload API**, with an expiry (`valid_until`) on each indicator. This teaches the API and runs for free.
+3. **Check it landed** in the threat intelligence table (`ThreatIntelIndicators` in current workspaces). Write `schemas/ThreatIntelIndicators.yaml` from what you see.
+4. **Rule 3** (`ti_ip_match.yaml`): join active, unexpired IP indicators to `AzureActivity.CallerIpAddress`. Start from Microsoft's *TI map IP entity to AzureActivity* template and simplify it. Put the indicator details into the alert's custom details.
+5. **Safe trigger.** Add one manual indicator containing **your own current public IP**, tagged `lab-test`, expiring in a few hours. Make any Azure change (for example add a tag to `<RG_TARGETS>`). Rule 3 fires. Remove the indicator afterwards.
+6. **Response.** Generate a second playbook, `ti-match-enrich`, with the same method as Phase 2: it comments with the indicator source, confidence and first-seen date (and, optionally, a VirusTotal lookup through an API-key integration profile).
+
+### Done when
+
+- [ ] Feed indicators arrive on a schedule and expire as expected.
+- [ ] The test indicator produces an incident whose comments show the indicator details.
+- [ ] Rule 3 has tests, including an expired indicator that must **not** match.
+
+### Learning checkpoint
+
+- Why do indicators need an expiry? What happens to alert quality without one?
+- How would you measure whether a feed is worth paying for (or keeping)?
+
+---
+
+## 10. Phase 4: Build your own security agents
+
+### 10.1 Why build them
+
+Microsoft ships ready-made agents in Security Copilot, for example a **Phishing Triage Agent** in Defender that classifies user-reported phishing and explains its verdict, and a **Threat Intelligence Briefing Agent** that writes briefings tailored to an organisation. (Names as Microsoft used them at the time of writing.) The playbook generator in Phase 2 is itself an AI coding agent. Using these teaches the product. **Building your own** teaches how agents actually work: tools, loops, grounding, memory, evals and guardrails. That is what this phase is for.
+
+| Microsoft agent (inspiration) | Your agent in this lab | Input → output |
+|---|---|---|
+| Phishing Triage Agent | **4.1 Incident Triage Agent** | Sentinel alert/incident → verdict, reasoning and evidence as an incident comment |
+| Threat Intelligence Briefing Agent | **4.2 Threat Intel Briefing Agent** | CISA KEV + feed + inventory → weekly briefing + CVE files for anything relevant |
+| (no direct equivalent) | **4.3 Detection Engineering Agent** | CVE file in the repo → PR with rule + tests, or a "data gap" issue |
+
+The three agents chain: 4.2 writes `intel/cves/*.md` files, 4.3 turns them into pull requests, Phase 1's CI tests them, a human merges, Phase 1's CD deploys, and 4.1 triages the alerts the new rule creates.
+
+### 10.2 Ground rules for every agent
+
+- **Plain Python first, no agent framework.** You should be able to explain every line of the loop.
+- **Typed output.** Every agent returns a Pydantic model; invalid output is rejected and retried, never passed on.
+- **Read-only by default.** Agents query, read and comment. Changes go through pull requests or a reviewed playbook, never directly.
+- **Untrusted input.** Incident fields, resource names, CVE text and threat reports may contain prompt-injection text. Put them in clearly marked data sections, never give the agent a tool that can do damage, and validate output with code.
+- **Limits.** Maximum steps, maximum tokens and a cost cap per run; the run stops cleanly when reached.
+- **Observability.** Every run logs prompt version, model, tool calls, tokens, cost and result to a JSONL file (and later to Application Insights).
+- **Evals before trust.** Each agent has a golden set and an eval script that runs in CI.
+- **Identity.** In Azure, each agent runs with its own managed identity; API keys live in Key Vault.
+
+### 10.3 Stage 4.0: Agent foundations
+
+Build a small reusable core in `agents/core/`, one step at a time:
+
+| Step | Build | What you learn |
+|---|---|---|
+| 4.0a | One LLM call that turns an incident JSON into a typed summary | Prompting, structured output, validation |
+| 4.0b | A tool registry and one tool: `run_kql(query)` (read-only, row limit, timeout) | Tool definitions, tool calls and results |
+| 4.0c | The loop: call the model, run requested tools, feed results back, stop on a final answer or a limit | How an agent actually works |
+| 4.0d | Run logging + token/cost accounting | Observability, cost control |
+| 4.0e | Unit tests with a fake LLM that returns scripted responses | Testing agents without paying for calls |
+
+The loop, in pseudocode:
+
+```
+messages = [system_prompt, user_task]
+for step in range(MAX_STEPS):
+    reply = llm(messages, tools=TOOLS)
+    log(step, reply)
+    if reply.is_final:
+        return OutputModel.validate(reply.content)    # reject invalid output
+    for call in reply.tool_calls:
+        result = TOOLS[call.name](**call.args)          # tools are read-only
+        messages.append(tool_result(call.id, truncate(result)))
+raise StepLimitReached
+```
+
+**Done when:** `python -m agents.core.demo <incident.json>` runs the loop with `run_kql`, prints a typed result, and writes a run log; tests pass with the fake LLM.
+
+### 10.4 Stage 4.1: Incident Triage Agent
+
+**Job:** when a lab alert fires, investigate it the way a tier-1 analyst would, and write a verdict back to the incident.
+
+**Tools**
+
+| Tool | Does | Access |
+|---|---|---|
+| `get_incident(id)` | Incident, alerts, entities | Microsoft Sentinel Reader |
+| `run_kql(query)` | Read-only queries (e.g. "what else did this caller do in the last 24 h?") | Log Analytics Reader |
+| `ip_reputation(ip)` | VirusTotal / AbuseIPDB lookup | API key from Key Vault |
+| `ti_lookup(value)` | Search `ThreatIntelIndicators` | Log Analytics Reader |
+| `get_feedback(rule, entities)` | Past analyst feedback for similar incidents | Feedback store |
+| `add_comment(id, text)` | The only write: an incident comment | Microsoft Sentinel Responder |
+
+**Output model**
+
+```yaml
+verdict: true_positive | benign_positive | false_positive | needs_human
+confidence: low | medium | high
+summary: one paragraph in plain language
+evidence:            # every claim backed by a query or lookup
+  - claim: "Caller deleted 3 resource groups in 10 minutes"
+    source: kql
+    query: "AzureActivity | where Caller == ... "
+recommended_actions: [ ... ]   # suggestions only
+```
+
+**Steps**
+
+1. **4.1a Local:** run the agent from the CLI against exported incidents from Phases 1–3.
+2. **4.1b Golden set:** save 10 incidents (sanitised JSON) in `agents/evals/triage/` with the verdict a human analyst would give. Include tricky ones: your own CI deleting a temporary resource group (benign), a resource group deleted from the test-indicator IP (true positive).
+3. **4.1c Eval in CI:** `agents/evals/run.py triage` scores verdict accuracy, checks that every evidence item has a source, and fails the PR if accuracy drops below a threshold you set.
+4. **4.1d Feedback memory** (the way Microsoft's triage agent learns from analysts): an analyst comment like `#feedback benign: rg-ci-* deletions are the CI pipeline` is stored (a JSONL file first, a Log Analytics custom table later). `get_feedback` returns relevant past feedback for the agent to consider. Add a golden case that only passes when feedback is used.
+5. **4.1e Deploy:** package the agent as an Azure Function (Python, HTTP trigger, managed identity, function key). Create an **API-key integration profile** pointing at the function, and generate a playbook `triage-agent-call` that sends the alert to the function. Add an enhanced-alert-trigger automation rule for all lab rules. Keep the agent's work under the playbook's 10-minute limit, or have the function return immediately and comment when done.
+
+**Done when:** a real alert gets an agent comment on its incident within a few minutes, with verdict and evidence; the eval passes in CI; a feedback comment changes the next verdict for a similar incident.
+
+### 10.5 Stage 4.2: Threat Intel Briefing Agent
+
+**Job:** once a week, tell the team what changed in the threat landscape that matters *to this environment*, and turn relevant CVEs into work items.
+
+**Inputs**
+
+- `intel/inventory.yaml`: technologies in your environment (Azure services in use, plus anything you choose to pretend you run, such as "Citrix NetScaler", "Apache Log4j" or "Fortinet FortiGate"). Keeping it explicit makes "relevant" testable.
+- CISA KEV catalogue (JSON), NVD API for CVE details, the Phase 3 feed, and the last week's incidents.
+
+**Tools:** `kev_since(date)`, `nvd_get(cve_id)`, `run_kql(query)`, `read_file(path)`.
+
+**Output**
+
+1. `briefings/<YYYY>-W<week>.md`: new KEV entries and which inventory items they affect, feed activity, incidents of the week, three recommended actions. Every statement links to its source.
+2. For each KEV entry that matches the inventory, a file `intel/cves/<CVE-ID>.md` (template in 10.6).
+3. Both delivered as **one pull request** from `.github/workflows/ti-briefing.yml` (scheduled weekly, plus `workflow_dispatch`).
+
+**Steps:** build locally → golden set of 5 past weeks with the CVEs a human would flag → eval (precision and recall of "relevant" CVEs, every claim sourced) → schedule.
+
+**Done when:** a scheduled run opens a PR with a briefing and at least one CVE file, and the eval runs in CI.
+
+### 10.6 Stage 4.3: Detection Engineering Agent (CVE → rule)
+
+**Job:** turn a CVE file in the repo into a detection rule and tests that pass this repo's CI, or explain honestly why it cannot.
+
+**Trigger:** a push that adds or changes a file under `intel/cves/` (written by a human or by Stage 4.2), or `workflow_dispatch` with a file path. Runs in `.github/workflows/detection-agent.yml`.
+
+**CVE input file** (`intel/cves/CVE-YYYY-NNNNN.md`)
+
+```markdown
+---
+cve: CVE-YYYY-NNNNN
+source_urls: [https://nvd.nist.gov/vuln/detail/CVE-YYYY-NNNNN, <vendor advisory>, <research blog>]
+kev: true
+products: [<affected product and versions>]
+---
+## Summary
+<what the vulnerability is and how it is exploited, in your words or quoted with sources>
+
+## Known behaviour after exploitation
+<observable actions: processes, network connections, Azure control-plane operations, ...>
+
+## Notes for the detection engineer
+<optional hints, existing public detections, false-positive concerns>
+```
+
+**What the agent reads (the grounding)**
+
+| File | Why |
+|---|---|
+| The CVE file | What to detect |
+| `schemas/*.yaml` | The only tables and columns that exist in this lab. The agent may not invent others |
+| `docs/detection-style.md` | How rules here are written |
+| `detections/**` + `tests/**` | Existing rules as examples (few-shot) |
+
+**Tools:** `read_file`, `list_files`, `run_kql` (read-only; to look at real data shapes), `validate_rule` (calls `scripts/validate.py`), `run_tests` (calls `scripts/run_kql_tests.py`), `write_file` (only under `detections/` and `tests/` in the agent's branch).
+
+**Flow**
 
 ```mermaid
-flowchart LR
-    NVD[cve2rule research] -. you read it .-> H[You hand-write<br/>Sigma rule + held-out logs]:::new
-    TS[Table schema<br/>LinuxProcess_CL]:::new --> PL[Custom pySigma pipeline<br/>field + table mapping]:::new
-    H --> PR[Pull request]
-    PR --> CI[GitHub Actions<br/>sigma check, rule tests,<br/>convert to KQL]:::new
-    PL --> CI
-    CI --> K[KQL file<br/>CI artifact]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
+flowchart TD
+    A[CVE file added] --> B[Read CVE, schemas,<br/>style guide, example rules]
+    B --> C{Observable with<br/>this lab's data?}
+    C -- no --> G[Open 'data gap' issue:<br/>which telemetry is missing,<br/>suggested data source]
+    C -- yes --> D[Draft rule YAML + tests]
+    D --> E[validate_rule + run_tests]
+    E -- fail, attempts < 3 --> D
+    E -- fail, attempts = 3 --> H[Open draft PR marked<br/>'needs human', with errors]
+    E -- pass --> F[Open PR: status experimental,<br/>reasoning + sources in description]
+    F --> I[Phase 1 CI runs again] --> J[Human review + merge] --> K[CD deploys disabled rule]
 ```
 
-**Steps**
-1. **Table schema** (`lab/infra/schemas/LinuxProcess_CL.json`): define the columns of the custom process-creation table, for example `TimeGenerated`, `Computer`, `User`, `ProcessName`, `CommandLine`, `ParentProcessName`, `ParentCommandLine`. This schema is the contract for test logs, the pipeline and the Sentinel table in Slice 1a. *Learn: data modelling for detections.*
-2. **Custom pySigma pipeline** (`pipelines/linux_process.yml`): map Sigma's `process_creation` fields (`Image`, `CommandLine`, `ParentImage`, ...) to the table columns and set the KQL target table. The built-in Kusto pipelines target Windows/Defender tables, so a Linux rule on a custom table needs its own mapping. *Learn: pySigma processing pipelines.*
-3. **Hand-write the Log4Shell rule** using the NVD output and public reports: `rules/log4shell_java_child_shell.yml` (a `java` parent spawning `sh`, `bash`, `curl` or `wget`), with a unique `id`, `status: experimental`, ATT&CK tags, `falsepositives` and `level`. Validate it with `sigma check`. *Learn: Sigma syntax, logsources, modifiers.*
-4. **Held-out test logs** (`tests/rules/holdout/`): positive events (exploit-like child processes) and negative events (normal Tomcat/Jenkins/Elasticsearch child processes), written by you and using exactly the table schema columns. No generator ever sees this set (see Slice 4). *Learn: detection unit testing, false-positive thinking.*
-5. **Rule tests**: a pytest that converts the rule to SQLite with the custom field mapping (or runs Zircolite with the same mapping), loads the JSON logs, and asserts that every positive event matches and no negative event does. Load the logs into a table that has every column the query names (missing ones as `NULL`), because SQLite fails to prepare a query that names an unknown column. Pin `pySigma`, `sigma-cli` and the backends to versions that work together; `sigma-cli` 3.1 needs pySigma 1.x while the newest SQLite backend needs pySigma 2.x. *Learn: testing detections without a SIEM, dependency pinning.*
-6. **Extend CI**: add `sigma check`, the rule tests, and `sigma convert -t kusto -p pipelines/linux_process.yml`. Upload the `.kql` file as a build artifact and print it to the job summary. *Learn: pipeline stages, artifacts.*
+Notes:
 
-**Done when:** a PR with the hand-written rule turns CI green and produces a `.kql` file that queries `LinuxProcess_CL` using its real column names.
+- **Most CVEs will be data gaps in this lab** because it only has Azure control-plane and TI data. That is the right answer, not a failure. Good data-gap issues (which table, which fields, which connector) are valuable output. CVEs in Azure services, identity or cloud misconfiguration are the best candidates for real rules.
+- Generated rules always start as `status: experimental`, so they deploy **disabled** until a human promotes them.
+- The PR description lists every source used and states assumptions. Reviewers check that the rule's logic follows from the CVE, not just that tests pass. The agent wrote those tests too, so passing them proves little on its own.
+- **Held-out tests:** keep a few human-written test cases per golden CVE in `agents/evals/detection/heldout/` that the agent never sees. The eval runs generated rules against them.
+
+**Steps:** 4.3a local CLI on one CVE file → 4.3b validate/test loop → 4.3c data-gap path → 4.3d golden set of 5 CVE files (at least 2 detectable, 3 data gaps) with expected outcomes and held-out tests → 4.3e GitHub workflow that opens PRs and issues with a bot token limited to `contents: write` on agent branches, `pull-requests: write` and `issues: write`.
+
+**Done when:** adding a CVE file produces either a passing PR with an experimental rule or a clear data-gap issue, with no human help; the eval runs in CI.
 
 ---
 
-### Slice 1a: Azure foundation and identity
+## 11. Stretch goals
 
-**Goal:** your existing Sentinel workspace is described in code, has the custom tables the rules need, and GitHub can reach it with no stored secrets and only the permissions it needs.
+Pick only after Phase 4.3 is done.
 
-```mermaid
-flowchart LR
-    WS[Existing Sentinel workspace<br/>referenced in Bicep]:::new --> T[LinuxProcess_CL<br/>NetScaler_CL]:::new
-    DCR[DCR<br/>stream to table mapping]:::new --> T
-    APP[Entra app registration]:::new --> FC[Federated credential<br/>repo + sentinel-lab env]:::new
-    FC --> RB[Scoped role assignments]:::new
-    B[Budget alert]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
+- **MCP server** for the lab's tools (`run_kql`, `get_incident`, `add_comment`, `validate_rule`) so any MCP client, including your coding assistant, can use them.
+- **Agent hand-offs:** when the triage agent sees repeated `benign_positive` feedback for a rule, it opens a tuning issue for the detection engineering agent.
+- **Compare SOAR options:** rebuild `nsg-remediate` as a classic Logic App playbook (deployable as Bicep from CI) and write up the trade-offs against the generated Python playbook.
+- **Endpoint telemetry:** one small Linux VM with Azure Monitor Agent, so more CVEs become detectable. Watch the cost.
+- **Defender for Cloud** free tier alerts connected to Sentinel, triaged by the same agent.
+- **Coverage report:** ATT&CK Navigator layer generated from rule metadata in CI.
+- **Framework comparison:** rebuild one agent with an agent framework and write up what you gained and lost.
+
+---
+
+## 12. Spec-driven workflow with OpenSpec
+
+[OpenSpec](https://github.com/Fission-AI/openspec) is a lightweight spec-driven workflow for building with AI coding assistants. Each piece of work starts as a **change** (proposal, spec deltas, design, tasks). The change is agreed before code is written, then built, then archived. Archiving merges its spec deltas into `openspec/specs/`, which becomes the current description of how the system behaves.
+
+**This README** is the roadmap. **`openspec/specs/`** is the requirement-by-requirement description of what has actually been built.
+
+### Setup
+
+```bash
+npm install -g @fission-ai/openspec@latest   # needs Node.js 20.19+
+openspec init                                # choose your AI coding tool
 ```
 
-**Steps**
-1. **Reference the workspace in Bicep** (`lab/infra/`): use `existing` resources for the workspace you already deployed, so IaC adds to it without recreating it. Run infra deployments yourself with `az deployment group create`; CI does not get permission to change infrastructure. *Learn: IaC against existing resources.*
-2. **Budget alert and teardown**: a budget with an email alert on the resource group, and a script that removes everything this project adds. Set the workspace's daily ingestion cap. *Learn: cloud cost control.*
-3. **Custom tables**: create `LinuxProcess_CL` from the Slice 0b schema file, and `NetScaler_CL` for the Citrix example. *Learn: Log Analytics custom tables.*
-4. **DCR**: a data collection rule that maps an input stream to each table, using the Logs Ingestion API. *Learn: DCRs and ingestion-time transformation.*
-5. **Entra app and OIDC**: an app registration with a federated credential whose subject is `repo:<owner>/cve_to_rule:environment:sentinel-lab`, so only jobs running in that GitHub Environment can get a token. *Learn: workload identity federation.*
-6. **Least-privilege roles**, each scoped as narrowly as possible:
+### Workflow per change
 
-   | Identity | Role | Scope | Used for |
-   |---|---|---|---|
-   | GitHub deploy app | Microsoft Sentinel Contributor | Workspace | Create, update, delete analytics rules |
-   | GitHub deploy app | Monitoring Metrics Publisher | DCR only | Send synthetic logs |
-   | GitHub deploy app | Log Analytics Reader | Workspace | Post-deploy alert check |
-   | You | Owner (or Contributor + User Access Administrator) | Resource group | Infra deployments, role assignments |
+| Step | Command (Claude Code) | Result |
+|---|---|---|
+| Explore (optional) | `/opsx:explore` | Think through the idea against the repo |
+| Propose | `/opsx:propose <change-name>` | `openspec/changes/<change-name>/` with `proposal.md`, `specs/`, `design.md`, `tasks.md` |
+| Review | (you) | Edit the proposal and specs until they are right. This is where most of the learning happens |
+| Apply | `/opsx:apply` | Implement `tasks.md`, ticking tasks off |
+| Archive | `/opsx:archive` | Move to `changes/archive/<date>-<name>/` and merge spec deltas into `openspec/specs/` |
 
-   *Learn: Azure RBAC, scope, separation of duties.*
-7. **Protected environment**: create the `sentinel-lab` GitHub Environment with you as required reviewer, and store only non-secret IDs there (tenant, subscription, client ID, workspace, DCR endpoint). *Learn: deployment gates.*
-8. **Smoke test**: a manual workflow in that environment that logs in with OIDC and lists analytics rules. It proves the identity works before any deployment code exists.
+Other tools use slightly different command spellings; see the OpenSpec README.
 
-**Done when:** both custom tables exist, the budget alert is active, and the smoke-test workflow lists your analytics rules using OIDC with no secrets in the repo or in GitHub.
+### Planned changes
 
----
+| Phase | Change | Capability spec |
+|---|---|---|
+| 0 | `setup-activity-log-and-oidc` | `lab-environment` |
+| 1 | `add-detection-format-and-ci` | `detection-pipeline` |
+| 1 | `add-rg-deletion-rule` | `detection-rules` |
+| 2 | `add-nsg-open-rule` | `detection-rules` |
+| 2 | `add-nsg-remediation-playbook` | `soar-response` |
+| 3 | `add-threat-feed-ingestion` | `threat-intel` |
+| 3 | `add-ti-ip-match-rule`, `add-ti-match-enrich-playbook` | `detection-rules`, `soar-response` |
+| 4.0 | `add-agent-core` | `agent-core` |
+| 4.1 | `add-triage-agent`, `add-triage-feedback-memory`, `deploy-triage-agent` | `triage-agent` |
+| 4.2 | `add-ti-briefing-agent` | `ti-briefing-agent` |
+| 4.3 | `add-detection-engineering-agent`, `add-detection-agent-workflow` | `detection-engineering-agent` |
 
-### Slice 1b: Detection-as-code to Sentinel
+### Example spec delta
 
-**Goal:** a merged Sigma rule becomes a live analytics rule, fires on synthetic data, and disappears from Sentinel when it is deleted from `rules/`.
+`openspec/changes/add-rg-deletion-rule/specs/detection-rules/spec.md`
 
-```mermaid
-flowchart LR
-    M[Merge to main] --> DY[deploy.yml]:::new
-    DY --> A{sentinel-lab<br/>approval}
-    A --> O[OIDC login]
-    O --> SY[Sync: create / update / delete<br/>analytics rules]:::new
-    SY --> AR[Analytics rule<br/>in Sentinel]:::new
-    IN[Synthetic logs<br/>Logs Ingestion API]:::new --> T[LinuxProcess_CL]
-    T --> AR
-    AR --> AL[Alert]:::new
-    AL --> PC[Post-deploy check]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
+```markdown
+## ADDED Requirements
+
+### Requirement: Detect resource group deletion
+The system SHALL raise a Medium-severity incident when an Azure resource group is deleted successfully.
+
+#### Scenario: Successful deletion
+- **WHEN** an AzureActivity event with operation RESOURCEGROUPS/DELETE and status Success is ingested
+- **THEN** exactly one alert is raised for that CorrelationId
+- **AND** the incident includes the caller account, caller IP and resource ID as entities
+
+#### Scenario: Failed deletion
+- **WHEN** the deletion fails
+- **THEN** no alert is raised
 ```
 
-**Steps**
-1. **Rule packaging** (`deploy/`): wrap the KQL as a scheduled analytics rule payload with severity, ATT&CK tactics and techniques, query frequency and lookback taken from the Sigma metadata. Derive the analytics rule's ID from the Sigma `id`, so redeploying updates the rule in place instead of creating a duplicate. *Learn: mapping detection metadata to the SIEM.*
-2. **Sync** (`tools/sentinel.py`): compare `rules/` with the rules this project has deployed (marked with a tag or name prefix), then create, update or delete. Never touch rules the project didn't create. *Learn: declarative deployment, reconciliation.*
-3. **Status lifecycle**: `experimental` rules deploy disabled; `test` and `stable` rules deploy enabled. Promote a rule by changing its `status` in a PR. *Learn: detection-as-code lifecycle.*
-4. **`deploy.yml`**: on merge to `main`, rebuild the KQL, wait for approval in `sentinel-lab`, log in with OIDC, and sync. Add a `--dry-run` mode that prints the plan, and run it in PRs without Azure access. *Learn: CD, environments, plan/apply.*
-5. **Synthetic ingestion (endpoint)**: a script that sends the held-out positive and negative logs through the Logs Ingestion API into `LinuxProcess_CL`. The logs already match the table, so this also tests the field mapping against the real table. Give test events a run ID so the check can find them.
-6. **Synthetic ingestion (appliance)**: for the Citrix example, a matching pipeline in `pipelines/` for `NetScaler_CL`, and a replay of synthetic NetScaler events. *Learn: appliance telemetry when no endpoint agent is possible.*
-7. **Post-deploy check**: poll `SecurityAlert` (with a timeout that allows for ingestion delay and the rule's schedule) and confirm the rule fired on the positive events and not on the negative ones. Fail the workflow otherwise. Test with the rule temporarily enabled if it is `experimental`. *Learn: verifying a deployment, not just running it.*
-
-**Done when:** a merged rule appears in Sentinel, replayed positive logs produce an alert while negatives don't, deleting a rule from `rules/` removes it from Sentinel, and the Citrix replay reaches `NetScaler_CL`.
+Every scenario has a matching test case in `tests/detections/` (or an eval case for agents). That link is deliberate.
 
 ---
 
-### Slice 2: Researcher agent, grounding and evals
+## 13. Troubleshooting
 
-**Goal:** the first LLM agent, trustworthy and measurable from day one.
+| Symptom | Likely cause | Check |
+|---|---|---|
+| `AzureActivity` is empty | Diagnostic setting missing or pointing at another workspace | `az monitor diagnostic-settings subscription list` |
+| OIDC login fails with a subject mismatch error | Federated credential `subject` does not match the workflow (branch vs environment vs PR) | Compare the subject in the error with the credential |
+| Rule deployed but never fires | Rule disabled (`experimental`), status values differ from the test data, or lookback too short | Run the query by hand over 24 h; check `ActivityStatusValue` values |
+| Same event creates several incidents | Missing `ingestion_time()` filter or missing `CorrelationId` dedupe | Rule query |
+| Incident has no entities | Entity column not in `project`, or empty in the data | `validate.py`; run the query and inspect columns |
+| Playbook generator or Automation tab missing | Workspace not connected to the Defender portal, or Defender RBAC permission not assigned (can take up to 2 hours) | Defender portal settings; your RBAC roles |
+| Playbook never runs | Playbook still disabled, or automation rule condition does not match the alert title | Active Playbooks tab; incident Activities tab |
+| Playbook gets `401`/`403` from ARM | Integration profile scope wrong, secret expired, or app lacks the role on `<RG_TARGETS>` / workspace | Integration profile; role assignments |
+| Agent costs climb | Large tool results, no step limit | Truncate tool output; check run logs for step counts |
+| Agent invents tables or columns | Not grounded in `schemas/` | Validate generated KQL columns against the schema in code |
 
-```mermaid
-flowchart LR
-    U[CLI] --> NVD[NVD client]
-    U --> KEV[CISA KEV client]:::new
-    U --> ATT[ATT&CK lookup<br/>STIX data]:::new
-    CFG[Config<br/>pinned model, token caps]:::new --> R
-    NVD --> R[Researcher agent<br/>LLM, structured output]:::new
-    KEV --> R
-    ATT --> R
-    R --> I[out/CVE-ID/intel.json]:::new
-    G[Golden set<br/>tests/evals/]:::new --> E[Eval harness]:::new
-    I --> E
-    E --> S[Scores per field<br/>eval.yml artifact]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
+---
+
+## 14. Costs, safety and teardown
+
+### Costs
+
+- Azure Activity ingestion into Sentinel is free. The other data here is small.
+- The playbook generator is included with Microsoft Sentinel at the time of writing. Azure Functions Consumption has a free grant.
+- LLM calls: set a provider spend limit plus per-run token caps. The eval suites are the biggest regular cost; keep golden sets small and run full evals only when agent code or prompts change.
+- The budget alert from Phase 0 catches surprises.
+
+### Safety
+
+- Only `<RG_TARGETS>` can be changed by automation, and playbooks check the scope in code as well.
+- Generated playbook code is read and reviewed before it is enabled.
+- Agents never get write access to Azure resources.
+- Test indicators use your own IP, are tagged `lab-test`, and expire.
+- Sanitise any real data before committing it (account names, IPs, subscription IDs).
+- Push protection blocks accidental secrets.
+
+### Teardown
+
+```bash
+az group delete -n <RG_TARGETS>  --yes
+az group delete -n <RG_SENTINEL> --yes
+az monitor diagnostic-settings subscription delete --name activity-to-sentinel
+az ad app delete --id <CI_APP>
+az ad app delete --id <CD_APP>
+az ad app delete --id <PB_APP>
 ```
 
-**Steps**
-1. **Config** (`config.py`, pydantic-settings): LLM provider, a pinned model version (not a floating alias), a per-call token limit and a per-run token cap. A run that hits the cap stops with a clear error. *Learn: cost and reproducibility controls.*
-2. **CISA KEV client** (`tools/cisa_kev.py`): download and cache the KEV JSON, look up a CVE, validate it with Pydantic. *Learn: data validation, caching.*
-3. **ATT&CK lookup** (`tools/attack.py`): load the Enterprise ATT&CK STIX bundle, look up techniques by ID and name, and reject unknown IDs. *Learn: knowledge-base grounding.*
-4. **Researcher agent** (`agents/researcher.py`): one LangGraph node that calls the tools and returns a `CveIntel` Pydantic model through structured output, including KEV fields (date added, due date, ransomware use). The agent reports what the tools return and never guesses these values. *Learn: prompts, structured outputs, tool calling.*
-5. **CLI writes intel**: `cve2rule research CVE-2021-44228` now writes `out/CVE-2021-44228/intel.json` and logs token usage for the run. Unit tests use a fake LLM so CI never calls a real model. *Learn: dependency injection for testability.*
-6. **Golden set**: 5 to 10 CVEs (including Log4Shell and the Citrix example) with expected CVSS, KEV status, CWE and affected products, checked by hand against NVD and CISA.
-7. **Eval harness** (`tests/evals/`, pytest marker `eval`): run the Researcher on the golden set and score schema validity and per-field accuracy. The set is small, so treat accuracy as a trend between runs, not a pass/fail threshold. Schema validity is the only hard failure. *Learn: evaluating LLM output.*
-8. **`eval.yml`**: runs on `workflow_dispatch` and on a weekly schedule with the pinned model, under the per-run token cap. It uploads scores, model name and token usage as an artifact so changes in quality or cost show up. `ci.yml` keeps using the fake LLM. *Learn: separating deterministic CI from nondeterministic evals.*
-
-**Done when:** `cve2rule research CVE-2021-44228` writes a valid `intel.json` within the token cap, the eval run reports per-field accuracy and token usage for every golden CVE, and `ci.yml` still runs fully offline.
+Also delete the generated playbooks, automation rules and integration profiles in the Defender portal, remove the GitHub secrets, and revoke any LLM and enrichment API keys.
 
 ---
 
-### Slice 3: Hunting agent
+## 15. Project checklist
 
-**Goal:** IOCs, ATT&CK techniques and hypotheses, each traceable to a source.
+- [ ] **Phase 0:** activity logs in Sentinel; workspace in the Defender portal; OIDC working; repo protections on
+- [ ] **Phase 1:** Rule 1 deployed through CI/CD; real incident captured
+- [ ] **Phase 2:** Rule 2 + generated playbook; automatic remediation captured; out-of-scope case not remediated
+- [ ] **Phase 3:** feed ingested on a schedule; TI match incident enriched by a playbook
+- [ ] **4.0:** agent core with tests and run logging
+- [ ] **4.1:** triage agent comments on real incidents; eval in CI; feedback memory works
+- [ ] **4.2:** weekly briefing PR with CVE files; eval in CI
+- [ ] **4.3:** CVE file → rule PR or data-gap issue; eval with held-out tests in CI
+- [ ] Each phase has a write-up in `notes/` (what was built, what broke, what was learned) and evidence in `docs/evidence/`
+- [ ] Teardown tested
 
-```mermaid
-flowchart LR
-    R[Researcher agent] --> F[Report fetcher<br/>untrusted text]:::new
-    F --> H[Hunting agent<br/>LLM]:::new
-    H --> V[Provenance check<br/>deterministic]:::new
-    V --> J[out/CVE-ID/hunt.json]:::new
-    J -. you read it .-> W[You still hand-write<br/>the rule]
-    classDef new stroke:#16a34a,stroke-width:3px
-```
 
-**Steps**
-1. **Report fetcher**: fetch reference URLs from the NVD record, strip HTML, enforce size limits and an allow-list of domains, and mark the content as untrusted. *Learn: prompt-injection surfaces.*
-2. **Hunting agent** (`agents/hunter.py`): output IOCs where each has `value`, `type`, `source_url`, `quote` and `confidence`; ATT&CK techniques with a rationale; and testable hypotheses. *Learn: grounding, hallucination control.*
-3. **Provenance check**: deterministic code that confirms each `quote` exists in the fetched source and each IOC value appears in its quote. Drop or flag anything that fails. *Learn: verifying LLM output in code.*
-4. **ATT&CK validation**: every technique ID must exist in the STIX data from Slice 2.
-5. **Two-node graph**: Researcher → Hunter in LangGraph with typed state. This is the first sequential pipeline. *Learn: LangGraph state and edges.*
-6. **Hunting evals**: add expected IOCs and techniques to the golden set, and track precision, recall and the unsupported-IOC rate.
 
-**Done when:** `cve2rule hunt CVE-2021-44228` writes `hunt.json`, every IOC passes the provenance check, and the sparse Citrix case returns few IOCs instead of made-up ones.
-
----
-
-### Slice 4: Detection Engineer agent and full graph
-
-**Goal:** the system writes the rule and its tests. Your hand-written Slice 0b rule and held-out logs become the benchmark.
-
-```mermaid
-flowchart LR
-    R[Researcher] --> H[Hunter]
-    H --> D[Detection Engineer<br/>LLM]:::new
-    D --> Q[Code Quality<br/>deterministic]:::new
-    Q --> V[Validator<br/>sigma check + rule tests]:::new
-    V -- fail, retries left --> D
-    V -- pass --> O[rules/ + tests/rules/]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
-```
-
-**Steps**
-1. **Detection Engineer agent** (`agents/detection_engineer.py`): generate a Sigma rule and its positive and negative test logs from the hypotheses and IOCs, using the table schema so the logs have the right columns. *Learn: generation with structured output.*
-2. **Code Quality checks** (`agents/code_quality.py`, deterministic): required fields (`id`, `title`, `status`, `level`, `logsource`, `falsepositives`, `attack.t*` tags), a rule `id` that is unique across `rules/`, new rules starting as `status: experimental`, no wildcard-only selectors, no single-field process-lineage rule without filters, no secrets.
-3. **Validator** (`agents/validator.py`): reuses the Slice 0b rule-test code and custom pipeline and returns structured errors.
-4. **Retry loop**: a conditional edge sends validator errors back to the Detection Engineer, with a maximum number of retries before stopping with a clear failure. *Learn: conditional edges, bounded loops.*
-5. **Wire the full graph** in `graph.py` and add `cve2rule run CVE-ID`. *Learn: state machines.*
-6. **Avoid circular testing**: the same LLM writes the rule and its test logs, so it can pass its own tests. Its own tests must still pass, but they don't count as evidence. Score every generated rule against the human-written logs in `tests/rules/holdout/`. Keep that folder out of the agent's prompts, tools and file access. *Learn: held-out evaluation.*
-7. **Detection evals**: run the generated rule against the held-out logs, record detection and false-positive rates, and compare them with your Slice 0b rule. Add SigmaHQ rules tagged with a CVE (for example `cve.2021-44228`) as a larger reference set: compare the generated rule's logic and ATT&CK tags with the community rule.
-8. **Prior-art check**: before generating, search SigmaHQ for rules already tagged with the CVE and include them in the PR as references, so you can choose to adopt one instead.
-
-**Done when:** `cve2rule run CVE-2021-44228` writes a rule and tests locally, they pass the same CI checks as your Slice 0b rule, and the generated rule matches all held-out positives with no held-out negatives.
-
----
-
-### Slice 5: PR automation
-
-**Goal:** the agent opens the PR; you stay the reviewer; the Slice 1b pipeline deploys it.
-
-```mermaid
-flowchart LR
-    G[Full graph] --> B[GitHub tool<br/>branch, commit, PR]:::new
-    B --> PR[Pull request<br/>with intel summary]:::new
-    PR --> CI[ci.yml + deploy dry-run]
-    CI --> RV{You review}
-    RV -- merge --> DY[deploy.yml<br/>Slice 1b]
-    RV -- request changes --> X[Re-run graph manually]
-    classDef new stroke:#16a34a,stroke-width:3px
-```
-
-**Steps**
-1. **Least-privilege identity**: a GitHub App (or fine-grained token) limited to this repo, with only contents and pull-request permissions, and unable to push to `main` or approve deployments. *Learn: least privilege for agents.*
-2. **GitHub tool** (`tools/github_pr.py`): create a `rule/CVE-ID` branch, commit the rule and tests, and open a PR. *Learn: GitHub API.*
-3. **PR body**: CVE summary, KEV status, IOCs with sources, ATT&CK techniques, hypotheses, local and held-out test results, and SigmaHQ prior art, so you can review without rerunning anything.
-4. **CI job summary**: show the generated KQL, the rule-test results and the deploy dry-run plan in the PR checks.
-
-**Done when:** `cve2rule run CVE-ID` ends by printing a PR URL, CI is green on that PR, you merge it, and after your approval the rule is live in Sentinel.
-
----
-
-### Slice 6: Atomic Red Team telemetry
-
-**Goal:** check rules against real telemetry, not only synthetic JSON.
-
-```mermaid
-flowchart LR
-    VM[Isolated Linux VM<br/>snapshots]:::new --> ART[Invoke-AtomicRedTeam]:::new
-    ART --> TEL[Sysmon for Linux / auditd<br/>+ Azure Monitor Agent]:::new
-    TEL --> WS[Sentinel workspace]
-    WS --> PF[Parser function<br/>same columns as LinuxProcess_CL]:::new
-    PF --> AR[Analytics rule]
-    AR --> RES[Validator records<br/>fired / missed]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
-```
-
-**Steps**
-1. **Lab VM** on an isolated network with no production access and no real credentials. Take a clean snapshot. *Learn: safe lab design.*
-2. **Telemetry**: install Sysmon for Linux or auditd plus the Azure Monitor Agent with a DCR for the VM, and confirm events arrive in the workspace.
-3. **Parse real telemetry into the same shape**: Sysmon for Linux events usually land in the `Syslog` table with the event XML inside `SyslogMessage`, so they don't match `LinuxProcess_CL`. Use the ASIM Sysmon-for-Linux parser if it's available in your workspace, or write a KQL function that outputs the same columns as `LinuxProcess_CL`. Point the rule at a union of the table and the function so one rule covers synthetic and real data; deploy the function as code alongside the rules. *Learn: normalisation, parsers.*
-4. **Install Invoke-AtomicRedTeam** (needs PowerShell 7 on Linux). Run `Invoke-AtomicTest T1059.004 -ShowDetails`, then `-CheckPrereqs`, then the test itself. *Learn: ATT&CK-mapped emulation.*
-5. **Map atomics to rules**: each rule declares its expected atomic test in metadata, and the validator records whether the rule fired.
-6. **Log4Shell gap**: there is no official atomic, so write a custom atomic that reproduces the behaviour (a Java process spawning a shell), or replay synthetic logs.
-7. **Cleanup**: run `-Cleanup` and revert the snapshot after every session. Stop or deallocate the VM when idle to control cost.
-
-**Done when:** at least one rule has a recorded atomic run with a fired or missed result, and the VM is back at its clean snapshot.
-
----
-
-### Slice 7: SOAR playbook and agent
-
-**Goal:** turn a Sentinel incident into an approved, verified and reversible containment action, using a real Sentinel playbook flow.
-
-```mermaid
-flowchart LR
-    INC[Sentinel incident] --> AU[Automation rule]:::new
-    AU --> PB[Logic App playbook<br/>managed identity]:::new
-    PB --> S[SOAR agent service<br/>FastAPI + LangGraph]:::new
-    S --> EN[Enrich<br/>IOC confidence, asset, policy]:::new
-    EN --> P[Proposed action]:::new
-    P --> HA{LangGraph interrupt<br/>you approve?}:::new
-    HA -- yes --> FW[Simulated firewall API<br/>FastAPI, Docker]:::new
-    FW --> VF[Verify + audit log<br/>comment on incident]:::new
-    VF -.-> RB[Rollback]:::new
-    HA -- no --> CL[Close incident<br/>with rationale]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
-```
-
-**Steps**
-1. **Simulated firewall** (`lab/firewall_api/`): `POST /block`, `GET /status`, `DELETE /block/{ip}`, an audit log, and refusal of anything outside the documentation IP ranges. *Learn: designing a safe action target.*
-2. **SOAR agent as a service** (`services/soar_api.py`): a FastAPI endpoint that accepts an incident ID, runs the SOAR graph, and pauses at the approval interrupt. Start with the CLI polling the Sentinel incidents API; add the playbook trigger in step 4. *Learn: agent as API.*
-3. **SOAR agent** (`agents/soar.py`): read the incident and its entities, enrich them, and propose an action with confidence and rationale. *Learn: agent decision records.*
-4. **Playbook as code** (`lab/playbooks/`, Bicep): an automation rule that runs a Logic App playbook on incidents from this project's rules. The playbook's managed identity has *Microsoft Sentinel Responder* on the workspace, and the playbook calls the SOAR service. Grant Sentinel permission to run playbooks in that resource group. Expose the SOAR service to the playbook in a way that doesn't open it to the internet without auth (for example a shared key in Key Vault, or a tunnel with access control). *Learn: Sentinel automation, managed identities.*
-5. **Approval**: a LangGraph interrupt pauses until you approve or reject from the CLI (or a simple approval page). *Learn: human-in-the-loop as code.*
-6. **Execute, verify, audit, roll back**: idempotent block, a status check afterwards, an audit entry, a comment on the Sentinel incident, and a tested rollback path. *Learn: safe agent actions.*
-7. **Integration tests**: run the firewall container in CI and test approve, reject, duplicate-block and rollback with a fake Sentinel client.
-
-**Done when:** a synthetic alert creates an incident, the playbook calls the SOAR agent, an approved block shows up in `/status`, the audit log and the incident comments, rollback removes it, and a rejected proposal closes the incident with a rationale.
-
----
-
-### Slice 8: Hardening
-
-**Goal:** make the core system safe to demo and maintain.
-
-**Steps**
-1. **Guardrails**: an allow-list of actions, protected IP ranges, rate limits, and prompt-injection tests that use poisoned report content.
-2. **Observability**: structlog, optional LangSmith or Phoenix traces, and per-run cost and latency.
-3. **Security review**: bandit, Dependabot, secret scanning, and a review of every GitHub and Azure permission against the Slice 1a table.
-4. **Docs and demo**: architecture notes in `docs/` and a recorded Log4Shell end-to-end run.
-
-**Done when:** the full Log4Shell run works from CLI to rollback, and the security checks are part of CI.
-
----
-
-### Slice 9: Multi-agent extensions
-
-**Goal:** add the more advanced orchestration patterns on top of a core that already works. Each part is independent; do them in any order. Every new agent and message channel gets the same guardrails as Slice 8.
-
-```mermaid
-flowchart LR
-    CVE[CVE intel] --> TR[Triage supervisor<br/>router]:::new
-    TR -- endpoint --> DE1[Endpoint<br/>Detection Engineer]
-    TR -- appliance --> DE2[Appliance<br/>Detection Engineer]:::new
-    TR -- no behavioural rule --> NR[Report: patch + hunt only]:::new
-    subgraph Hunt[Parallel hunting]
-        F1[Report 1] & F2[Report 2] & F3[Report N] --> MG[Merge + dedupe IOCs]:::new
-    end
-    DP[Detection pipeline<br/>A2A agent]:::new <-->|A2A| SA[SOAR agent<br/>A2A agent]:::new
-    MCP[MCP server<br/>NVD, KEV, ATT&CK, Sigma]:::new
-    classDef new stroke:#16a34a,stroke-width:3px
-```
-
-**9a. Parallel hunting (fan-out / fan-in)**
-1. Use LangGraph's `Send` API to run one Hunter call per fetched report in parallel.
-2. Merge results with a state reducer, deduplicate IOCs by normalised value, and keep every source for each IOC.
-3. Add `cve2rule batch CVE-1 CVE-2 ...` that runs whole graphs for several CVEs concurrently under one shared token cap.
-4. Compare cost, latency and IOC recall against the sequential Hunter on the golden set. *Learn: parallel branches, reducers, concurrency limits.*
-
-**9b. Triage supervisor (router)**
-1. A triage agent (`agents/triage.py`) reads the CVE intel and chooses a route: endpoint process rule, appliance/network rule, or no behavioural rule (for example memory corruption with no clear telemetry, like `CVE-2026-88772`).
-2. Split the Detection Engineer into specialists with their own prompts, schemas and pipelines (`LinuxProcess_CL` vs `NetScaler_CL`).
-3. The "no rule" route writes a short report with patch guidance and hunting queries instead of forcing a weak rule.
-4. Add the expected route to the golden set and track routing accuracy. *Learn: supervisor/router pattern, specialist agents.*
-
-**9c. Agent-to-agent (A2A) between detection and SOAR**
-1. Run the detection pipeline and the SOAR agent as two separate services, each publishing an A2A agent card that describes its skills.
-2. When a rule deploys, the detection agent sends the SOAR agent the rule's context (IOCs with sources, hypotheses, recommended response) so the SOAR agent has it when an incident arrives.
-3. When the SOAR agent sees a false positive, it sends feedback back to the detection agent, which opens a PR that tunes the rule. You still review it.
-4. Authenticate every call between agents, validate every message against a schema, and treat message content as untrusted input. *Learn: A2A protocol, service boundaries, trust between agents.*
-
-**9d. MCP tool server**
-1. Expose the NVD, KEV, ATT&CK and Sigma-convert tools through an MCP server (`services/mcp_server.py`).
-2. Switch one agent to use the tools over MCP instead of direct imports, and check results are identical.
-3. Use the same server from an MCP client such as Claude Code or VS Code for interactive hunting. *Learn: MCP, tools as a service.*
-
-**Done when:** each part you build has its own eval or integration test, and the core Log4Shell run from Slice 8 still passes unchanged.
-
----
-
-## 10. Atomic Red Team quick guide
-
-- Atomics are small, ATT&CK-mapped tests (YAML) that generate real telemetry.
-- Typical flow: `Invoke-AtomicTest <TechniqueID> -ShowDetails` → `-CheckPrereqs` → run → inspect logs in Sentinel → `-Cleanup`.
-- Use a disposable VM with snapshots, no production network access, and no real credentials.
-- Use results to answer: did the telemetry arrive, did the rule fire, what was missed?
-
----
-
-## 11. Safety and security
-
-- Lab only, in a personal Azure subscription used for nothing else. Never connect it to an employer tenant or use work data.
-- Synthetic IPs from documentation ranges (`203.0.113.0/24`, `198.51.100.0/24`).
-- SOAR never calls a real firewall; the API is simulated.
-- Treat scraped threat report text and messages from other agents as untrusted input (prompt injection risk).
-- No stored cloud secrets: OIDC for GitHub, managed identities in Azure, `.env` only for local LLM keys.
-- Least-privilege roles at the narrowest scope; CI cannot change infrastructure or role assignments.
-- Human approval required for PR merge, Sentinel deployment and containment.
-- Budget alert and ingestion cap on the workspace from Slice 1a.
-
----
-
-## 12. Getting started
-
-```powershell
-git clone <your-repo-url> ; cd cve_to_rule
-python -m venv .venv ; .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-copy .env.example .env      # add NVD API key; LLM key from Slice 2
-pytest
-cve2rule research CVE-2021-44228
-```
-
-(The `research` command prints the NVD record after Slice 0a and writes `intel.json` after Slice 2. Azure setup is in Slice 1a.)
-
----
-
-## 13. Milestones
-
-- [ ] M0a: CI green with lint, types and tests; NVD client and CLI (Slice 0a)
-- [ ] M0b: Hand-written rule → CI → tested KQL artifact on the real table schema (Slice 0b)
-- [ ] M1a: Custom tables, DCR, budget alert, OIDC identity with scoped roles (Slice 1a)
-- [ ] M1b: Rule deployed to Sentinel with undeploy; alert fires on synthetic data (Slice 1b)
-- [ ] M2: Researcher agent with KEV + ATT&CK grounding, eval harness and capped `eval.yml` (Slice 2)
-- [ ] M3: Hunting agent with sourced IOCs (Slice 3)
-- [ ] M4: Rules and tests generated automatically and scored on the held-out set (Slice 4)
-- [ ] M5: Agent opens PRs; you review, merge and approve deployment (Slice 5)
-- [ ] M6: Atomic Red Team telemetry validated (Slice 6)
-- [ ] M7: Playbook-triggered SOAR block with approval, verification, rollback (Slice 7)
-- [ ] M8: Hardened and documented (Slice 8)
-- [ ] M9: Parallel hunting, triage supervisor, A2A, MCP (Slice 9, any order)
-
----
-
-## 14. References
-
-- NVD API: https://nvd.nist.gov/developers
-- CISA KEV: https://www.cisa.gov/known-exploited-vulnerabilities-catalog
-- MITRE ATT&CK: https://attack.mitre.org
-- Sigma / pySigma / SigmaHQ rules: https://github.com/SigmaHQ
-- Atomic Red Team: https://github.com/redcanaryco/atomic-red-team
-- LangGraph: https://langchain-ai.github.io/langgraph/
-- Microsoft Sentinel: https://learn.microsoft.com/azure/sentinel/
-- Logs Ingestion API: https://learn.microsoft.com/azure/azure-monitor/logs/logs-ingestion-api-overview
-- GitHub OIDC with Azure: https://docs.github.com/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-azure
-- A2A protocol: https://a2a-protocol.org
-- Model Context Protocol: https://modelcontextprotocol.io

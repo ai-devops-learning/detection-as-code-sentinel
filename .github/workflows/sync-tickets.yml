@@ -1,0 +1,52 @@
+name: sync-tickets
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tickets/**"
+      - "scripts/sync_tickets.py"
+      - ".github/workflows/sync-tickets.yml"
+  pull_request:
+    paths:
+      - "tickets/**"
+      - "scripts/sync_tickets.py"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only show what would be created"
+        type: boolean
+        default: false
+
+# One run at a time so two pushes cannot race and create the same issue twice.
+concurrency:
+  group: sync-tickets
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pyyaml
+      - run: python scripts/sync_tickets.py --validate-only
+
+  sync:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pyyaml
+      - name: Create missing issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PROJECT_URL: ${{ vars.PROJECT_URL }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+          BRANCH: ${{ github.ref_name }}
+        run: python scripts/sync_tickets.py --branch "$BRANCH" $DRY_RUN
