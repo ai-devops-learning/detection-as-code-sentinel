@@ -116,6 +116,18 @@ def existing_ticket_issues(repo: str) -> dict[int, dict]:
     return found
 
 
+def next_ticket_id(tickets_dir: Path, repo: str | None, start: int = 100) -> int:
+    """Highest id seen in folders and issue markers, plus one. Issues are included so
+    the id of a deleted ticket folder is never handed out again."""
+    ids = [int(m["id"]) for p in tickets_dir.iterdir() if p.is_dir() and (m := FOLDER_RE.match(p.name))]
+    if repo:
+        try:
+            ids += list(existing_ticket_issues(repo))
+        except (RuntimeError, FileNotFoundError) as exc:
+            print(f"warning: could not read issues ({exc}); using local folders only", file=sys.stderr)
+    return max(ids, default=start - 1) + 1
+
+
 def ensure_labels(repo: str, wanted: set[str]) -> None:
     out = gh(["label", "list", "--repo", repo, "--limit", "500", "--json", "name"])
     have = {x["name"].lower() for x in json.loads(out)}
@@ -187,6 +199,7 @@ def main() -> int:
     ap.add_argument("--branch", default="main", help="branch used for source links")
     ap.add_argument("--project-url", default=os.environ.get("PROJECT_URL", ""))
     ap.add_argument("--status", default="Backlog", help="Status column for new cards")
+    ap.add_argument("--next-id", action="store_true", help="print the next unused ticket id and exit")
     ap.add_argument("--validate-only", action="store_true", help="lint tickets, no GitHub calls")
     ap.add_argument("--dry-run", action="store_true", help="show what would be created, change nothing")
     args = ap.parse_args()
@@ -195,6 +208,9 @@ def main() -> int:
     if not tickets_dir.is_dir():
         print(f"error: {tickets_dir} not found", file=sys.stderr)
         return 1
+    if args.next_id:
+        print(next_ticket_id(tickets_dir, args.repo))
+        return 0
     tickets, errors = load_tickets(tickets_dir)
     for e in errors:
         print(f"error: {e}", file=sys.stderr)
